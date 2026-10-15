@@ -482,14 +482,16 @@ class GoldApp:
                     width=10).grid(row=1, column=4, padx=12, pady=(2, 10))
 
         # الجدول
-        cols = ("name", "qty", "buy", "cost", "cur", "val", "pl", "pct")
-        heads = ("الاسم", "الكمية", "سعر الشراء", "التكلفة",
-                 "السعر الحالي", "القيمة", "الربح/الخسارة", "%")
+        cols = ("name", "status", "qty", "buy", "cost", "cur", "val", "pl", "pct")
+        heads = ("الاسم", "الحالة", "الكمية", "سعر الشراء", "التكلفة",
+                 "السعر الحالي/البيع", "القيمة", "الربح/الخسارة", "%")
         self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=6)
         for c, h in zip(cols, heads):
             self.tree.heading(c, text=h)
-            self.tree.column(c, anchor="center", width=108)
-        self.tree.column("name", width=130)
+            self.tree.column(c, anchor="center", width=100)
+        self.tree.column("name", width=120)
+        self.tree.column("status", width=74)
+        self.tree.column("pct", width=70)
         self.tree.tag_configure("pos", foreground=t["profit"])
         self.tree.tag_configure("neg", foreground=t["loss"])
         self.tree.tag_configure("odd", background=t.get("row_alt", CARD))
@@ -500,11 +502,14 @@ class GoldApp:
                                 font=("Segoe UI", 9, "bold"))
         self.tree.tag_configure("totalneg", background=t["total_bg"], foreground=t["loss"],
                                 font=("Segoe UI", 9, "bold"))
+        self.tree.tag_configure("sold", background=t.get("card2", "#1e2530"))
 
         btns = tk.Frame(self.root, bg=BG)
         self._mkbtn(btns, "🗑 حذف المحدد", self.del_item, kind="danger",
                     font_size=9).pack(side="left", pady=4)
         self._mkbtn(btns, "مسح الكل", self.clear_all, kind="neutral",
+                    font_size=9).pack(side="left", padx=6)
+        self._mkbtn(btns, "💰 أمر بيع", self.open_sell, kind="neutral",
                     font_size=9).pack(side="left", padx=6)
         self._mkbtn(btns, "🔔 إضافة تنبيه السعر", self.open_alerts, kind="primary",
                     font_size=9).pack(side="left", padx=6)
@@ -597,6 +602,107 @@ class GoldApp:
             self.holdings = []
             self.save()
             self.render()
+
+    # ---------- أمر بيع ----------
+    def open_sell(self):
+        # المراكز المفتوحة فقط (غير المباعة)
+        open_idx = [i for i, h in enumerate(self.holdings) if h.get("sell") is None]
+        if not open_idx:
+            messagebox.showinfo("أمر بيع", "لا توجد مراكز مفتوحة لبيعها")
+            return
+        t = self.theme
+        BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
+        GOLD, ATXT, TXT, MUT = t["accent"], t["accent_text"], t["text"], t["muted"]
+        win = tk.Toplevel(self.root)
+        win.title("أمر بيع")
+        win.configure(bg=BG)
+        win.geometry("520x340")
+        win.transient(self.root)
+
+        frm = tk.LabelFrame(win, text="💰 بيع مركز", bg=CARD, fg=GOLD,
+                            font=("Segoe UI", 10, "bold"))
+        frm.pack(fill="both", expand=True, padx=12, pady=12)
+        sym = CUR[self.cur]["sym"]
+
+        # اختيار المركز
+        r1 = tk.Frame(frm, bg=CARD); r1.pack(fill="x", padx=6, pady=8)
+        tk.Label(r1, text="المركز:", bg=CARD, fg=TXT).pack(side="right")
+        labels = []
+        for i in open_idx:
+            h = self.holdings[i]
+            unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
+            labels.append("{} — {:g} {} @ {}{:,.2f}".format(
+                h["name"], h["qty"], unit_txt, sym, h["buy"] * self.rate()))
+        sel_var = tk.StringVar(value=labels[0])
+        ttk.OptionMenu(r1, sel_var, labels[0], *labels).pack(
+            side="right", padx=6, fill="x", expand=True)
+
+        # الكمية (افتراضي: الكل)
+        r2 = tk.Frame(frm, bg=CARD); r2.pack(fill="x", padx=6, pady=8)
+        tk.Label(r2, text="الكمية المباعة:", bg=CARD, fg=TXT).pack(side="right")
+        e_qty = tk.Entry(r2, width=12)
+        e_qty.pack(side="right", padx=6)
+        lbl_max = tk.Label(r2, text="", bg=CARD, fg=MUT, font=("Segoe UI", 8))
+        lbl_max.pack(side="right", padx=4)
+
+        # سعر البيع بالعملة الحالية
+        r3 = tk.Frame(frm, bg=CARD); r3.pack(fill="x", padx=6, pady=8)
+        tk.Label(r3, text="سعر البيع للوحدة ({}):".format(CUR[self.cur]["name"]),
+                 bg=CARD, fg=TXT).pack(side="right")
+        e_price = tk.Entry(r3, width=12)
+        e_price.pack(side="right", padx=6)
+
+        def on_sel(*_):
+            i = open_idx[labels.index(sel_var.get())]
+            h = self.holdings[i]
+            unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
+            e_qty.delete(0, "end"); e_qty.insert(0, "{:g}".format(h["qty"]))
+            lbl_max.config(text="(الأقصى {:g} {})".format(h["qty"], unit_txt))
+            # اقتراح سعر البيع السوقي الحالي
+            cur_disp = self.current_per_unit_disp(h["unit"])
+            if cur_disp:
+                e_price.delete(0, "end"); e_price.insert(0, "{:.2f}".format(cur_disp))
+        sel_var.trace_add("write", on_sel)
+        on_sel()
+
+        def do_sell():
+            i = open_idx[labels.index(sel_var.get())]
+            h = self.holdings[i]
+            try:
+                qty = float(e_qty.get())
+                price_disp = float(e_price.get())
+            except ValueError:
+                messagebox.showwarning("تنبيه", "الرجاء إدخال كمية وسعر بيع صحيحين", parent=win)
+                return
+            if qty <= 0 or price_disp <= 0:
+                messagebox.showwarning("تنبيه", "الكمية والسعر يجب أن يكونا أكبر من صفر", parent=win)
+                return
+            if qty > h["qty"] + 1e-9:
+                messagebox.showwarning("تنبيه", "الكمية المباعة أكبر من المتاح", parent=win)
+                return
+            sell_usd = price_disp / self.rate()   # تخزين داخلي بالدولار
+            sell_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if abs(qty - h["qty"]) < 1e-9:
+                # بيع كامل → تحويل المركز نفسه إلى مباع
+                h["sell"] = sell_usd
+                h["sell_date"] = sell_date
+            else:
+                # بيع جزئي → تقسيم المركز
+                h["qty"] = h["qty"] - qty   # يبقى مفتوحاً
+                sold = {"name": h["name"], "qty": qty, "unit": h["unit"],
+                        "buy": h["buy"], "sell": sell_usd, "sell_date": sell_date}
+                self.holdings.insert(i + 1, sold)
+            self.save()
+            self.render()
+            win.destroy()
+
+        bar = tk.Frame(frm, bg=CARD); bar.pack(fill="x", padx=6, pady=14)
+        self._mkbtn(bar, "✔ تأكيد البيع", do_sell, kind="success",
+                    font_size=9).pack(side="right", padx=6)
+        self._mkbtn(bar, "إلغاء", win.destroy, kind="neutral",
+                    font_size=9).pack(side="right", padx=6)
+        tk.Label(frm, text="ملاحظة: البيع الجزئي يقسّم المركز (جزء مباع + جزء مفتوح).",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 8)).pack(anchor="e", padx=10)
 
     # ---------- التنبيهات ----------
     def add_alert(self):
@@ -839,43 +945,61 @@ class GoldApp:
         if not path:
             return
         ccy = CUR[self.cur]["name"]
-        headers = ["الاسم", "الكمية", "الوحدة",
+        headers = ["الاسم", "الحالة", "الكمية", "الوحدة",
                    "سعر الشراء/وحدة ({})".format(ccy),
                    "التكلفة ({})".format(ccy),
-                   "السعر الحالي/وحدة ({})".format(ccy),
-                   "القيمة الحالية ({})".format(ccy),
+                   "السعر الحالي/البيع ({})".format(ccy),
+                   "القيمة ({})".format(ccy),
                    "الربح/الخسارة ({})".format(ccy), "النسبة %"]
         rows = []
         t_cost = t_val = 0.0
         t_qty_g = 0.0
+        realized = 0.0
         for h in self.holdings:
             unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
-            cur_disp = self.current_per_unit_disp(h["unit"])
             cost_disp = h["qty"] * h["buy"] * self.rate()
-            value_disp = h["qty"] * cur_disp
-            pl = value_disp - cost_disp
-            pct = (pl / cost_disp * 100) if cost_disp else 0
-            t_cost += cost_disp
-            t_val += value_disp
-            t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
-            rows.append([
-                h["name"], round(h["qty"], 6), unit_txt,
-                round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
-                round(cur_disp, 3), round(value_disp, 3),
-                round(pl, 3), round(pct, 2),
-            ])
+            if h.get("sell") is not None:
+                sell_disp = h["sell"] * self.rate()
+                value_disp = h["qty"] * sell_disp
+                pl = value_disp - cost_disp
+                pct = (pl / cost_disp * 100) if cost_disp else 0
+                realized += pl
+                rows.append([
+                    h["name"], "مباع", round(h["qty"], 6), unit_txt,
+                    round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
+                    round(sell_disp, 3), round(value_disp, 3),
+                    round(pl, 3), round(pct, 2),
+                ])
+            else:
+                cur_disp = self.current_per_unit_disp(h["unit"])
+                value_disp = h["qty"] * cur_disp
+                pl = value_disp - cost_disp
+                pct = (pl / cost_disp * 100) if cost_disp else 0
+                t_cost += cost_disp
+                t_val += value_disp
+                t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
+                rows.append([
+                    h["name"], "مفتوح", round(h["qty"], 6), unit_txt,
+                    round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
+                    round(cur_disp, 3), round(value_disp, 3),
+                    round(pl, 3), round(pct, 2),
+                ])
         t_pl = t_val - t_cost
         t_pct = (t_pl / t_cost * 100) if t_cost else 0
-        rows.append(["∑ الإجمالي", round(t_qty_g, 3), "غرام",
+        rows.append(["∑ المفتوح (غير محقق)", "", round(t_qty_g, 3), "غرام",
                      "", round(t_cost, 3), "", round(t_val, 3),
                      round(t_pl, 3), round(t_pct, 2)])
+        rows.append(["∑ الربح المحقق (المباع)", "", "", "",
+                     "", "", "", "", round(realized, 3), ""])
+        rows.append(["∑ الإجمالي (محقق + غير محقق)", "", "", "",
+                     "", "", "", "", round(t_pl + realized, 3), ""])
         try:
             write_xlsx(path, headers, rows)
         except Exception as e:
             messagebox.showerror("تصدير Excel", "تعذّر حفظ الملف:\n{}".format(e))
             return
         messagebox.showinfo("تصدير Excel",
-                            "تم تصدير {} عملية شراء بنجاح.".format(len(self.holdings)))
+                            "تم تصدير {} سجل بنجاح.".format(len(self.holdings)))
 
     # ---------- نافذة تنبيه السعر (مستقلة) ----------
     def open_alerts(self):
@@ -1043,42 +1167,68 @@ class GoldApp:
         for i in self.tree.get_children():
             self.tree.delete(i)
         t_cost = t_val = 0.0
-        t_qty_g = 0.0            # إجمالي الكمية محوّلة إلى غرام
+        t_qty_g = 0.0            # إجمالي الكمية محوّلة إلى غرام (المراكز المفتوحة فقط)
+        realized = 0.0          # إجمالي الربح/الخسارة المحقق (المباع)
+        sym = CUR[self.cur]["sym"]
         for idx, h in enumerate(self.holdings):
             unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
-            cur_disp = self.current_per_unit_disp(h["unit"])
             cost_usd = h["qty"] * h["buy"]
-            value_disp = h["qty"] * cur_disp
             cost_disp = cost_usd * self.rate()
-            pl = value_disp - cost_disp
-            pct = (pl / cost_disp * 100) if cost_disp else 0
-            t_cost += cost_disp
-            t_val += value_disp
-            t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
-            tag = "pos" if pl > 0 else ("neg" if pl < 0 else "")
             stripe = "odd" if idx % 2 else "even"
-            row_tags = (tag, stripe) if tag else (stripe,)
-            sym = CUR[self.cur]["sym"]
-            self.tree.insert("", "end", tags=row_tags, values=(
-                h["name"],
-                "{:g} {}".format(h["qty"], unit_txt),
-                "{}{:,.2f}".format(sym, h["buy"] * self.rate()),
-                "{}{:,.2f}".format(sym, cost_disp),
-                "{}{:,.2f}".format(sym, cur_disp),
-                "{}{:,.2f}".format(sym, value_disp),
-                "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
-                "{}{:.2f}%".format("+" if pl > 0 else "", pct),
-            ))
+            sold_price = h.get("sell")
+            if sold_price is not None:
+                # ===== مركز مباع → ربح/خسارة محقق =====
+                sell_disp = sold_price * self.rate()
+                value_disp = h["qty"] * sell_disp
+                pl = value_disp - cost_disp
+                pct = (pl / cost_disp * 100) if cost_disp else 0
+                realized += pl
+                tag = "pos" if pl > 0 else ("neg" if pl < 0 else "")
+                row_tags = (tag, "sold") if tag else ("sold",)
+                self.tree.insert("", "end", tags=row_tags, values=(
+                    h["name"],
+                    "✔ مباع",
+                    "{:g} {}".format(h["qty"], unit_txt),
+                    "{}{:,.2f}".format(sym, h["buy"] * self.rate()),
+                    "{}{:,.2f}".format(sym, cost_disp),
+                    "{}{:,.2f}".format(sym, sell_disp),
+                    "{}{:,.2f}".format(sym, value_disp),
+                    "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
+                    "{}{:.2f}%".format("+" if pl > 0 else "", pct),
+                ))
+            else:
+                # ===== مركز مفتوح → ربح/خسارة غير محقق =====
+                cur_disp = self.current_per_unit_disp(h["unit"])
+                value_disp = h["qty"] * cur_disp
+                pl = value_disp - cost_disp
+                pct = (pl / cost_disp * 100) if cost_disp else 0
+                t_cost += cost_disp
+                t_val += value_disp
+                t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
+                tag = "pos" if pl > 0 else ("neg" if pl < 0 else "")
+                row_tags = (tag, stripe) if tag else (stripe,)
+                self.tree.insert("", "end", tags=row_tags, values=(
+                    h["name"],
+                    "● مفتوح",
+                    "{:g} {}".format(h["qty"], unit_txt),
+                    "{}{:,.2f}".format(sym, h["buy"] * self.rate()),
+                    "{}{:,.2f}".format(sym, cost_disp),
+                    "{}{:,.2f}".format(sym, cur_disp),
+                    "{}{:,.2f}".format(sym, value_disp),
+                    "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
+                    "{}{:.2f}%".format("+" if pl > 0 else "", pct),
+                ))
         self.update_price_labels()
         self.check_alerts()
         t_pl = t_val - t_cost
         t_pct = (t_pl / t_cost * 100) if t_cost else 0
-        sym = CUR[self.cur]["sym"]
-        # ===== سطر الإجمالي داخل الجدول =====
-        if self.holdings:
+        total_pl = t_pl + realized
+        # ===== سطر الإجمالي داخل الجدول (المراكز المفتوحة) =====
+        if any(h.get("sell") is None for h in self.holdings):
             ttag = "totalpos" if t_pl > 0 else ("totalneg" if t_pl < 0 else "total")
             self.tree.insert("", "end", tags=(ttag,), values=(
-                "∑ الإجمالي",
+                "∑ المفتوح",
+                "-",
                 "{:,.2f} غرام".format(t_qty_g),
                 "-",
                 "{}{:,.2f}".format(sym, t_cost),
@@ -1088,9 +1238,11 @@ class GoldApp:
                 "{}{:.2f}%".format("+" if t_pl > 0 else "", t_pct),
             ))
         self.lbl_sum.config(
-            text="التكلفة: {s}{c:,.2f}    |    القيمة الحالية: {s}{v:,.2f}    |    الربح/الخسارة: {sg}{s}{p:,.2f} ({sg}{pc:.2f}%)".format(
-                s=sym, c=t_cost, v=t_val, p=t_pl, pc=t_pct,
-                sg="+" if t_pl > 0 else ""),
+            text=("الربح المحقق: {sg_r}{s}{r:,.2f}    |    غير المحقق: {sg_u}{s}{u:,.2f}    |    الإجمالي: {sg_t}{s}{tp:,.2f}").format(
+                s=sym, r=realized, u=t_pl, tp=total_pl,
+                sg_r="+" if realized > 0 else "",
+                sg_u="+" if t_pl > 0 else "",
+                sg_t="+" if total_pl > 0 else ""),
             fg=self.theme["total"])
 
     def update_price_labels(self):
