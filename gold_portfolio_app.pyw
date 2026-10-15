@@ -247,6 +247,8 @@ class GoldApp:
         self.buy_margin = 0.0            # فرق الراجحي للشراء (يُضاف لسعر الغرام العالمي)
         self.holdings = []               # أسعار الشراء تُخزّن داخلياً بالدولار
         self.sells = []                  # عمليات البيع المحققة (سعر بيع مثبّت)
+        self.history = []                # سجل كل العمليات (شراء/بيع)
+        self.price_hist = []             # عينات سعر الأونصة [epoch, oz_usd] خلال اليوم
         self.alerts = []                 # تنبيهات الأسعار
         self.theme = dict(DEFAULT_THEME)
         self.titles = dict(DEFAULT_TITLES)
@@ -288,6 +290,8 @@ class GoldApp:
                 else:
                     migrated.append(h)
             self.holdings = migrated
+            self.history = d.get("history", [])
+            self.price_hist = d.get("price_hist", [])
             self.cur = d.get("cur", "USD")
             self.adjust = float(d.get("adjust", 5.22))
             self.buy_margin = float(d.get("buy_margin", 0.0))
@@ -311,6 +315,8 @@ class GoldApp:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump({"holdings": self.holdings, "cur": self.cur,
                            "sells": self.sells,
+                           "history": self.history,
+                           "price_hist": self.price_hist[-500:],
                            "adjust": self.adjust, "buy_margin": self.buy_margin,
                            "alerts": self.alerts,
                            "theme": self.theme, "theme_ver": THEME_VER,
@@ -538,6 +544,12 @@ class GoldApp:
                     font_size=9).pack(side="left", padx=6)
         self._mkbtn(btns, "💰 أمر بيع", self.open_sell, kind="neutral",
                     font_size=9).pack(side="left", padx=6)
+        self._mkbtn(btns, "📜 سجل العمليات", self.open_history, kind="neutral",
+                    font_size=9).pack(side="left", padx=6)
+        self._mkbtn(btns, "📐 حاسبة الزكاة", self.open_zakat, kind="neutral",
+                    font_size=9).pack(side="left", padx=6)
+        self._mkbtn(btns, "📈 مخطط اليوم", self.open_chart, kind="neutral",
+                    font_size=9).pack(side="left", padx=6)
         self._mkbtn(btns, "🔔 إضافة تنبيه السعر", self.open_alerts, kind="primary",
                     font_size=9).pack(side="left", padx=6)
         self._mkbtn(btns, "⬇ تصدير Excel", self.export_excel, kind="success",
@@ -608,8 +620,18 @@ class GoldApp:
             messagebox.showwarning("تنبيه", "الكمية والسعر يجب أن يكونا أكبر من صفر")
             return
         buy_usd = buy_disp / self.rate()   # تخزين داخلي بالدولار
+        unit = self.unit_var.get()
         self.holdings.append({"name": name or "بدون اسم", "qty": qty,
-                              "unit": self.unit_var.get(), "buy": buy_usd})
+                              "unit": unit, "buy": buy_usd})
+        factor = OZ_TO_G if unit == "oz" else 1
+        self.history.append({
+            "type": "buy",
+            "name": name or "بدون اسم",
+            "qty_g": qty * factor,
+            "price_usd": buy_usd / factor,     # دولار/غرام
+            "amount_usd": qty * buy_usd,        # إجمالي التكلفة (دولار)
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
         self.save()
         self.e_name.delete(0, "end"); self.e_qty.delete(0, "end"); self.e_buy.delete(0, "end")
         self.render()
@@ -764,12 +786,23 @@ class GoldApp:
             qty = min(qty, total_g)
             sell_usd = price_disp / self.rate()        # تثبيت سعر البيع (داخلياً بالدولار)
             cost_usd = self._consume_grams(qty)        # خصم الكمية + تكلفتها FIFO
+            sell_date = datetime.now().strftime("%Y-%m-%d %H:%M")
             self.sells.append({
                 "name": "بيع ذهب",
                 "qty_g": qty,
                 "sell": sell_usd,          # دولار/غرام (مثبّت)
                 "cost": cost_usd,          # تكلفة المخصوم (دولار)
-                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "date": sell_date,
+            })
+            self.history.append({
+                "type": "sell",
+                "name": "بيع ذهب",
+                "qty_g": qty,
+                "price_usd": sell_usd,              # دولار/غرام
+                "amount_usd": qty * sell_usd,       # قيمة البيع (دولار)
+                "cost_usd": cost_usd,               # تكلفة المباع (دولار)
+                "pl_usd": qty * sell_usd - cost_usd, # الربح/الخسارة المحقق (دولار)
+                "date": sell_date,
             })
             self.save()
             self.render()
@@ -782,6 +815,210 @@ class GoldApp:
                     font_size=9).pack(side="right", padx=6)
         tk.Label(frm, text="يُخصم المباع من الرصيد (FIFO) ويُثبّت سعر البيع لحساب الربح المحقق.",
                  bg=CARD, fg=MUT, font=("Segoe UI", 8)).pack(anchor="e", padx=10)
+
+    # ---------- سجل العمليات ----------
+    def open_history(self):
+        t = self.theme
+        BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+        sym = CUR[self.cur]["sym"]
+        win = tk.Toplevel(self.root)
+        win.title("سجل العمليات")
+        win.configure(bg=BG)
+        win.geometry("760x440")
+        win.transient(self.root)
+        tk.Label(win, text="📜 سجل كل العمليات", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="e", padx=14, pady=(12, 4))
+
+        cols = ("date", "type", "name", "qty", "price", "amount", "pl")
+        heads = ("التاريخ", "النوع", "الاسم", "الكمية (غ)",
+                 "السعر/غ", "القيمة", "الربح/الخسارة")
+        tv = ttk.Treeview(win, columns=cols, show="headings", height=14)
+        for c, h in zip(cols, heads):
+            tv.heading(c, text=h)
+            tv.column(c, anchor="center", width=100)
+        tv.column("date", width=120)
+        tv.column("name", width=120)
+        tv.tag_configure("buy", foreground=t.get("accent", "#e3b23c"))
+        tv.tag_configure("sellpos", foreground=t.get("profit", "#2ecc71"))
+        tv.tag_configure("sellneg", foreground=t.get("loss", "#ff5c5c"))
+        tv.pack(fill="both", expand=True, padx=12, pady=8)
+
+        tot_buy = tot_sell = tot_pl = 0.0
+        for e in self.history:
+            amount = e.get("amount_usd", 0) * self.rate()
+            price = e.get("price_usd", 0) * self.rate()
+            if e.get("type") == "buy":
+                tot_buy += amount
+                tv.insert("", "end", tags=("buy",), values=(
+                    e.get("date", ""), "▲ شراء", e.get("name", ""),
+                    "{:g}".format(round(e.get("qty_g", 0), 3)),
+                    "{}{:,.2f}".format(sym, price),
+                    "{}{:,.2f}".format(sym, amount), "-"))
+            else:
+                pl = e.get("pl_usd", 0) * self.rate()
+                tot_sell += amount
+                tot_pl += pl
+                tag = "sellpos" if pl >= 0 else "sellneg"
+                tv.insert("", "end", tags=(tag,), values=(
+                    e.get("date", ""), "▼ بيع", e.get("name", ""),
+                    "{:g}".format(round(e.get("qty_g", 0), 3)),
+                    "{}{:,.2f}".format(sym, price),
+                    "{}{:,.2f}".format(sym, amount),
+                    "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl)))
+
+        info = ("إجمالي الشراء: {s}{b:,.2f}    |    إجمالي البيع: {s}{sl:,.2f}    |    الربح المحقق: {sg}{s}{p:,.2f}").format(
+            s=sym, b=tot_buy, sl=tot_sell, p=tot_pl, sg="+" if tot_pl > 0 else "")
+        tk.Label(win, text=info if self.history else "لا توجد عمليات بعد.",
+                 bg=BG, fg=TXT, font=("Segoe UI", 10, "bold")).pack(anchor="e", padx=14, pady=(0, 6))
+
+        def clear_hist():
+            if self.history and messagebox.askyesno(
+                    "تأكيد", "مسح سجل العمليات؟ (لا يؤثر على الرصيد أو الأرباح)", parent=win):
+                self.history = []
+                self.save()
+                win.destroy()
+        bar = tk.Frame(win, bg=BG); bar.pack(fill="x", padx=12, pady=(0, 10))
+        self._mkbtn(bar, "مسح السجل", clear_hist, kind="danger",
+                    font_size=9).pack(side="left")
+        self._mkbtn(bar, "إغلاق", win.destroy, kind="neutral",
+                    font_size=9).pack(side="left", padx=6)
+
+    # ---------- حاسبة الزكاة ----------
+    def open_zakat(self):
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+        sym = CUR[self.cur]["sym"]
+        NISAB_G = 85.0            # نصاب الذهب ≈ 85 غراماً
+        ZAKAT_RATE = 0.025       # 2.5%
+        grams = self.total_open_grams()
+        gram_val_disp = self.gram_market_disp()   # سعر الغرام السوقي الحالي
+        total_val = grams * gram_val_disp
+        zakat_g = grams * ZAKAT_RATE
+        zakat_val = total_val * ZAKAT_RATE
+        reached = grams >= NISAB_G
+
+        win = tk.Toplevel(self.root)
+        win.title("حاسبة الزكاة")
+        win.configure(bg=BG)
+        win.geometry("460x360")
+        win.transient(self.root)
+        tk.Label(win, text="📐 حاسبة زكاة الذهب", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 13, "bold")).pack(anchor="e", padx=16, pady=(14, 8))
+
+        card = tk.Frame(win, bg=CARD); card.pack(fill="both", expand=True, padx=14, pady=8)
+
+        def row(label, value, color=None):
+            fr = tk.Frame(card, bg=CARD); fr.pack(fill="x", padx=14, pady=6)
+            tk.Label(fr, text=label, bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(side="right")
+            tk.Label(fr, text=value, bg=CARD, fg=color or TXT,
+                     font=("Segoe UI", 11, "bold")).pack(side="left")
+
+        row("الرصيد المملوك:", "{:,.3f} غرام".format(grams))
+        row("سعر الغرام الحالي:", "{}{:,.2f}".format(sym, gram_val_disp))
+        row("القيمة الإجمالية:", "{}{:,.2f}".format(sym, total_val))
+        row("النصاب (85غ):",
+            "✔ بلغ النصاب" if reached else "✖ دون النصاب",
+            t.get("profit") if reached else t.get("loss"))
+        tk.Frame(card, bg=t.get("border", "#2a3240"), height=1).pack(fill="x", padx=14, pady=8)
+        row("الزكاة الواجبة (2.5%):",
+            "{}{:,.2f}".format(sym, zakat_val) if reached else "لا تجب",
+            GOLD if reached else MUT)
+        if reached:
+            row("أو ما يعادل:", "{:,.3f} غرام ذهب".format(zakat_g), GOLD)
+
+        tk.Label(win, text="ملاحظة: تجب الزكاة بعد مرور الحول (سنة هجرية) على بلوغ النصاب.\n"
+                      "الحساب تقديري للاستئناس فقط.",
+                 bg=BG, fg=MUT, font=("Segoe UI", 8), justify="right").pack(anchor="e", padx=16, pady=(4, 10))
+
+    # ---------- مخطط سعر الغرام خلال اليوم ----------
+    def _record_price_sample(self, oz_usd):
+        """تسجيل عينة سعر (أونصة دولار) مع حذف ما تجاوز 24 ساعة."""
+        try:
+            now = time.time()
+            self.price_hist.append([now, float(oz_usd)])
+            cutoff = now - 24 * 3600
+            self.price_hist = [p for p in self.price_hist if p[0] >= cutoff][-500:]
+        except Exception:
+            pass
+
+    def open_chart(self):
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+        sym = CUR[self.cur]["sym"]
+        win = tk.Toplevel(self.root)
+        win.title("مخطط سعر الغرام - اليوم")
+        win.configure(bg=BG)
+        win.geometry("640x420")
+        win.transient(self.root)
+        tk.Label(win, text="📈 حركة سعر الغرام (السوقي) خلال اليوم", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="e", padx=14, pady=(12, 4))
+        W, H = 600, 320
+        cv = tk.Canvas(win, width=W, height=H, bg=CARD, highlightthickness=0)
+        cv.pack(padx=14, pady=8)
+
+        # عينات اليوم الحالي فقط
+        today = datetime.now().strftime("%Y-%m-%d")
+        rate = self.rate()
+        pts = [(ts, (oz / OZ_TO_G) * rate) for ts, oz in self.price_hist
+               if datetime.fromtimestamp(ts).strftime("%Y-%m-%d") == today]
+        if len(pts) < 2:
+            cv.create_text(W // 2, H // 2,
+                           text="لا توجد بيانات كافية بعد.\nاترك البرنامج مفتوحاً لتجميع الأسعار.",
+                           fill=MUT, font=("Segoe UI", 11), justify="center")
+            self._mkbtn(win, "إغلاق", win.destroy, kind="neutral",
+                        font_size=9).pack(pady=6)
+            return
+        pl, pr, pt, pb = 64, 20, 20, 40    # هوامش
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        if ymax - ymin < 1e-9:
+            ymin -= 1; ymax += 1
+        pad = (ymax - ymin) * 0.1
+        ymin -= pad; ymax += pad
+
+        def X(x):
+            return pl + (x - xmin) / (xmax - xmin) * (W - pl - pr) if xmax > xmin else pl
+
+        def Y(y):
+            return pt + (ymax - y) / (ymax - ymin) * (H - pt - pb)
+
+        # شبكة + محاور أفقية
+        for i in range(5):
+            yy = ymin + (ymax - ymin) * i / 4
+            y = Y(yy)
+            cv.create_line(pl, y, W - pr, y, fill=t.get("border", "#2a3240"))
+            cv.create_text(pl - 6, y, text="{:,.1f}".format(yy), fill=MUT,
+                           anchor="e", font=("Segoe UI", 8))
+        # تسميات زمنية (بداية/نهاية)
+        cv.create_text(pl, H - pb + 14,
+                       text=datetime.fromtimestamp(xmin).strftime("%H:%M"),
+                       fill=MUT, anchor="w", font=("Segoe UI", 8))
+        cv.create_text(W - pr, H - pb + 14,
+                       text=datetime.fromtimestamp(xmax).strftime("%H:%M"),
+                       fill=MUT, anchor="e", font=("Segoe UI", 8))
+        # الخط
+        coords = []
+        for x, y in pts:
+            coords += [X(x), Y(y)]
+        up = ys[-1] >= ys[0]
+        line_col = t.get("profit", "#2ecc71") if up else t.get("loss", "#ff5c5c")
+        cv.create_line(*coords, fill=line_col, width=2, smooth=True)
+        # نقطة النهاية
+        cv.create_oval(X(xs[-1]) - 4, Y(ys[-1]) - 4, X(xs[-1]) + 4, Y(ys[-1]) + 4,
+                       fill=line_col, outline="")
+        change = ys[-1] - ys[0]
+        pct = (change / ys[0] * 100) if ys[0] else 0
+        tk.Label(win,
+                 text="الافتتاح: {s}{o:,.2f}   •   الآن: {s}{c:,.2f}   •   التغيّر: {sg}{s}{d:,.2f} ({sg}{p:.2f}%)".format(
+                     s=sym, o=ys[0], c=ys[-1], d=change, p=pct,
+                     sg="+" if change > 0 else ""),
+                 bg=BG, fg=line_col, font=("Segoe UI", 10, "bold")).pack(anchor="e", padx=14, pady=4)
+        self._mkbtn(win, "إغلاق", win.destroy, kind="neutral",
+                    font_size=9).pack(pady=6)
 
     # ---------- التنبيهات ----------
     def add_alert(self):
@@ -1174,6 +1411,7 @@ class GoldApp:
                 direction = "same"
             self.spot_oz_usd = new_price
             ok = True
+            self._record_price_sample(new_price)
             self._ticks = getattr(self, "_ticks", 0) + 1
             self._fails = 0
             now = datetime.now().strftime("%H:%M:%S")
