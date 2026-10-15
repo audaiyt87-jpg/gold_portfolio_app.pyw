@@ -40,7 +40,7 @@ DEFAULT_RATES = {"USD": 1.0, "SAR": 3.75, "AED": 3.6725}
 
 # نسخة سمة الألوان — عند زيادتها تُطبَّق السمة الحديثة الجديدة
 # حتى لو كان لدى المستخدم سمة قديمة محفوظة.
-THEME_VER = 2
+THEME_VER = 3
 
 DEFAULT_THEME = {
     "bg": "#0b0e14",        # الخلفية العامة (أزرق-رمادي داكن حديث)
@@ -59,6 +59,7 @@ DEFAULT_THEME = {
     "row_alt": "#171c26",   # تظليل الصفوف المتناوبة
     "hover": "#f0c954",     # لون التمرير على الزر الذهبي
     "flash_same": "#ffd93b", # وميض أصفر عند ثبات السعر
+    "sold_bg": "#16351f",   # خلفية سطر عملية البيع (أخضر داكن)
 }
 DEFAULT_TITLES = {
     "title": "✦ محفظة الذهب ✦",
@@ -245,6 +246,7 @@ class GoldApp:
         self.adjust = 5.22               # فرق الراجحي للبيع (يُطرح من سعر الغرام العالمي)
         self.buy_margin = 0.0            # فرق الراجحي للشراء (يُضاف لسعر الغرام العالمي)
         self.holdings = []               # أسعار الشراء تُخزّن داخلياً بالدولار
+        self.sells = []                  # عمليات البيع المحققة (سعر بيع مثبّت)
         self.alerts = []                 # تنبيهات الأسعار
         self.theme = dict(DEFAULT_THEME)
         self.titles = dict(DEFAULT_TITLES)
@@ -269,6 +271,23 @@ class GoldApp:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
             self.holdings = d.get("holdings", [])
+            self.sells = d.get("sells", [])
+            # ترحيل بيانات قديمة: أي مركز يحمل سعر بيع → تحويله إلى عملية بيع
+            migrated = []
+            for h in list(self.holdings):
+                if h.get("sell") is not None:
+                    factor = OZ_TO_G if h.get("unit") == "oz" else 1
+                    qty_g = h.get("qty", 0) * factor
+                    self.sells.append({
+                        "name": h.get("name", "بيع ذهب"),
+                        "qty_g": qty_g,
+                        "sell": h["sell"] / factor,
+                        "cost": h.get("qty", 0) * h.get("buy", 0),
+                        "date": h.get("sell_date", ""),
+                    })
+                else:
+                    migrated.append(h)
+            self.holdings = migrated
             self.cur = d.get("cur", "USD")
             self.adjust = float(d.get("adjust", 5.22))
             self.buy_margin = float(d.get("buy_margin", 0.0))
@@ -291,6 +310,7 @@ class GoldApp:
         try:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump({"holdings": self.holdings, "cur": self.cur,
+                           "sells": self.sells,
                            "adjust": self.adjust, "buy_margin": self.buy_margin,
                            "alerts": self.alerts,
                            "theme": self.theme, "theme_ver": THEME_VER,
@@ -456,6 +476,10 @@ class GoldApp:
         self.lbl_upd = tk.Label(updfr, text="جارٍ التحميل...", bg=BG, fg=MUT,
                                 font=("Segoe UI", 8))
         self.lbl_upd.pack(side="right")
+        # مؤشر تغيّر السعر (سهم + مقدار التغيّر منذ آخر تحديث)
+        self.lbl_delta = tk.Label(updfr, text="", bg=BG, fg=MUT,
+                                  font=("Segoe UI", 9, "bold"))
+        self.lbl_delta.pack(side="right", padx=(0, 10))
 
         # نموذج الإضافة
         form = tk.Frame(self.root, bg=CARD, highlightthickness=1,
@@ -503,6 +527,9 @@ class GoldApp:
         self.tree.tag_configure("totalneg", background=t["total_bg"], foreground=t["loss"],
                                 font=("Segoe UI", 9, "bold"))
         self.tree.tag_configure("sold", background=t.get("card2", "#1e2530"))
+        self.tree.tag_configure("soldgreen", background=t.get("sold_bg", "#16351f"),
+                                foreground=t.get("profit", "#2ecc71"),
+                                font=("Segoe UI", 9, "bold"))
 
         btns = tk.Frame(self.root, bg=BG)
         self._mkbtn(btns, "🗑 حذف المحدد", self.del_item, kind="danger",
@@ -591,24 +618,75 @@ class GoldApp:
         sel = self.tree.selection()
         if not sel:
             return
-        idx = self.tree.index(sel[0])
-        if 0 <= idx < len(self.holdings):
+        iid = sel[0]
+        kind_idx = getattr(self, "row_map", {}).get(iid)
+        if not kind_idx:
+            return
+        kind, idx = kind_idx
+        if kind == "hold" and 0 <= idx < len(self.holdings):
             del self.holdings[idx]
             self.save()
             self.render()
+        elif kind == "sell" and 0 <= idx < len(self.sells):
+            if messagebox.askyesno("تراجع عن بيع",
+                                   "حذف عملية البيع؟ ستُعاد الكمية المباعة إلى الرصيد."):
+                s = self.sells.pop(idx)
+                # إعادة الكمية المباعة كمركز مفتوح بنفس تكلفتها
+                qty_g = s["qty_g"]
+                buy_per_g = (s["cost"] / qty_g) if qty_g else 0.0
+                self.holdings.append({"name": s.get("name", "مُسترد"),
+                                      "qty": qty_g, "unit": "g", "buy": buy_per_g})
+                self.save()
+                self.render()
 
     def clear_all(self):
-        if self.holdings and messagebox.askyesno("تأكيد", "مسح جميع المقتنيات؟"):
+        if (self.holdings or self.sells) and messagebox.askyesno(
+                "تأكيد", "مسح جميع المقتنيات وعمليات البيع؟"):
             self.holdings = []
+            self.sells = []
             self.save()
             self.render()
 
+    # ---------- مساعدات الكمية/التكلفة ----------
+    def total_open_grams(self):
+        """إجمالي الغرامات المتاحة (الرصيد المفتوح)."""
+        return sum(h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
+                   for h in self.holdings)
+
+    def avg_buy_per_gram_usd(self):
+        """متوسط سعر الشراء للغرام (دولار) عبر كل المراكز المفتوحة."""
+        g = self.total_open_grams()
+        if not g:
+            return 0.0
+        cost = sum(h["qty"] * h["buy"] for h in self.holdings)   # إجمالي التكلفة بالدولار
+        return cost / g
+
+    def _consume_grams(self, grams):
+        """خصم (grams) غراماً من المراكز بأسلوب FIFO، وإرجاع تكلفة المخصوم بالدولار."""
+        remaining = grams
+        cost = 0.0
+        i = 0
+        while remaining > 1e-9 and i < len(self.holdings):
+            h = self.holdings[i]
+            factor = OZ_TO_G if h["unit"] == "oz" else 1
+            g_avail = h["qty"] * factor
+            buy_per_g = h["buy"] / factor
+            take = min(remaining, g_avail)
+            cost += take * buy_per_g
+            new_g = g_avail - take
+            if new_g <= 1e-9:
+                del self.holdings[i]
+            else:
+                h["qty"] = new_g / factor
+                i += 1
+            remaining -= take
+        return cost
+
     # ---------- أمر بيع ----------
     def open_sell(self):
-        # المراكز المفتوحة فقط (غير المباعة)
-        open_idx = [i for i, h in enumerate(self.holdings) if h.get("sell") is None]
-        if not open_idx:
-            messagebox.showinfo("أمر بيع", "لا توجد مراكز مفتوحة لبيعها")
+        total_g = self.total_open_grams()
+        if total_g <= 1e-9:
+            messagebox.showinfo("أمر بيع", "لا يوجد رصيد مفتوح لبيعه")
             return
         t = self.theme
         BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
@@ -619,55 +697,58 @@ class GoldApp:
         win.geometry("520x340")
         win.transient(self.root)
 
-        frm = tk.LabelFrame(win, text="💰 بيع مركز", bg=CARD, fg=GOLD,
+        frm = tk.LabelFrame(win, text="💰 بيع كمية من الذهب", bg=CARD, fg=GOLD,
                             font=("Segoe UI", 10, "bold"))
         frm.pack(fill="both", expand=True, padx=12, pady=12)
         sym = CUR[self.cur]["sym"]
+        cur_sell_disp = self.gram_eff_disp()      # سعر الراجحي للبيع (للغرام) بالعملة الحالية
+        avg_buy_disp = self.avg_buy_per_gram_usd() * self.rate()
 
-        # اختيار المركز
-        r1 = tk.Frame(frm, bg=CARD); r1.pack(fill="x", padx=6, pady=8)
-        tk.Label(r1, text="المركز:", bg=CARD, fg=TXT).pack(side="right")
-        labels = []
-        for i in open_idx:
-            h = self.holdings[i]
-            unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
-            labels.append("{} — {:g} {} @ {}{:,.2f}".format(
-                h["name"], h["qty"], unit_txt, sym, h["buy"] * self.rate()))
-        sel_var = tk.StringVar(value=labels[0])
-        ttk.OptionMenu(r1, sel_var, labels[0], *labels).pack(
-            side="right", padx=6, fill="x", expand=True)
+        tk.Label(frm, text="الرصيد المتاح: {:,.3f} غرام  •  متوسط الشراء: {}{:,.2f}/غرام".format(
+            total_g, sym, avg_buy_disp), bg=CARD, fg=MUT,
+            font=("Segoe UI", 9)).pack(anchor="e", padx=10, pady=(6, 2))
 
-        # الكمية (افتراضي: الكل)
+        # الكمية بالغرام
         r2 = tk.Frame(frm, bg=CARD); r2.pack(fill="x", padx=6, pady=8)
-        tk.Label(r2, text="الكمية المباعة:", bg=CARD, fg=TXT).pack(side="right")
+        tk.Label(r2, text="الكمية المباعة (غرام):", bg=CARD, fg=TXT).pack(side="right")
         e_qty = tk.Entry(r2, width=12)
+        e_qty.insert(0, "{:g}".format(round(total_g, 3)))
         e_qty.pack(side="right", padx=6)
-        lbl_max = tk.Label(r2, text="", bg=CARD, fg=MUT, font=("Segoe UI", 8))
-        lbl_max.pack(side="right", padx=4)
+        tk.Label(r2, text="(الأقصى {:,.3f})".format(total_g), bg=CARD, fg=MUT,
+                 font=("Segoe UI", 8)).pack(side="right", padx=4)
 
-        # سعر البيع بالعملة الحالية
+        # سعر البيع للغرام (افتراضي: سعر الراجحي للبيع الحالي)
         r3 = tk.Frame(frm, bg=CARD); r3.pack(fill="x", padx=6, pady=8)
-        tk.Label(r3, text="سعر البيع للوحدة ({}):".format(CUR[self.cur]["name"]),
+        tk.Label(r3, text="سعر البيع/غرام ({}):".format(CUR[self.cur]["name"]),
                  bg=CARD, fg=TXT).pack(side="right")
         e_price = tk.Entry(r3, width=12)
+        if cur_sell_disp:
+            e_price.insert(0, "{:.2f}".format(cur_sell_disp))
         e_price.pack(side="right", padx=6)
+        tk.Label(r3, text="(سعر الراجحي للبيع الآن)", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 8)).pack(side="right", padx=4)
 
-        def on_sel(*_):
-            i = open_idx[labels.index(sel_var.get())]
-            h = self.holdings[i]
-            unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
-            e_qty.delete(0, "end"); e_qty.insert(0, "{:g}".format(h["qty"]))
-            lbl_max.config(text="(الأقصى {:g} {})".format(h["qty"], unit_txt))
-            # اقتراح سعر البيع السوقي الحالي
-            cur_disp = self.current_per_unit_disp(h["unit"])
-            if cur_disp:
-                e_price.delete(0, "end"); e_price.insert(0, "{:.2f}".format(cur_disp))
-        sel_var.trace_add("write", on_sel)
-        on_sel()
+        lbl_prev = tk.Label(frm, text="", bg=CARD, fg=GOLD, font=("Segoe UI", 9, "bold"))
+        lbl_prev.pack(anchor="e", padx=10, pady=4)
+
+        def preview(*_):
+            try:
+                qty = float(e_qty.get()); price_disp = float(e_price.get())
+            except ValueError:
+                lbl_prev.config(text=""); return
+            if qty <= 0 or price_disp <= 0:
+                lbl_prev.config(text=""); return
+            qty = min(qty, total_g)
+            val = qty * price_disp
+            cost = qty * avg_buy_disp
+            pl = val - cost
+            lbl_prev.config(text="قيمة البيع: {s}{v:,.2f}  •  الربح/الخسارة: {sg}{s}{p:,.2f}".format(
+                s=sym, v=val, p=pl, sg="+" if pl > 0 else ""))
+        e_qty.bind("<KeyRelease>", preview)
+        e_price.bind("<KeyRelease>", preview)
+        preview()
 
         def do_sell():
-            i = open_idx[labels.index(sel_var.get())]
-            h = self.holdings[i]
             try:
                 qty = float(e_qty.get())
                 price_disp = float(e_price.get())
@@ -677,21 +758,19 @@ class GoldApp:
             if qty <= 0 or price_disp <= 0:
                 messagebox.showwarning("تنبيه", "الكمية والسعر يجب أن يكونا أكبر من صفر", parent=win)
                 return
-            if qty > h["qty"] + 1e-9:
-                messagebox.showwarning("تنبيه", "الكمية المباعة أكبر من المتاح", parent=win)
+            if qty > total_g + 1e-6:
+                messagebox.showwarning("تنبيه", "الكمية المباعة أكبر من الرصيد المتاح", parent=win)
                 return
-            sell_usd = price_disp / self.rate()   # تخزين داخلي بالدولار
-            sell_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-            if abs(qty - h["qty"]) < 1e-9:
-                # بيع كامل → تحويل المركز نفسه إلى مباع
-                h["sell"] = sell_usd
-                h["sell_date"] = sell_date
-            else:
-                # بيع جزئي → تقسيم المركز
-                h["qty"] = h["qty"] - qty   # يبقى مفتوحاً
-                sold = {"name": h["name"], "qty": qty, "unit": h["unit"],
-                        "buy": h["buy"], "sell": sell_usd, "sell_date": sell_date}
-                self.holdings.insert(i + 1, sold)
+            qty = min(qty, total_g)
+            sell_usd = price_disp / self.rate()        # تثبيت سعر البيع (داخلياً بالدولار)
+            cost_usd = self._consume_grams(qty)        # خصم الكمية + تكلفتها FIFO
+            self.sells.append({
+                "name": "بيع ذهب",
+                "qty_g": qty,
+                "sell": sell_usd,          # دولار/غرام (مثبّت)
+                "cost": cost_usd,          # تكلفة المخصوم (دولار)
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            })
             self.save()
             self.render()
             win.destroy()
@@ -701,7 +780,7 @@ class GoldApp:
                     font_size=9).pack(side="right", padx=6)
         self._mkbtn(bar, "إلغاء", win.destroy, kind="neutral",
                     font_size=9).pack(side="right", padx=6)
-        tk.Label(frm, text="ملاحظة: البيع الجزئي يقسّم المركز (جزء مباع + جزء مفتوح).",
+        tk.Label(frm, text="يُخصم المباع من الرصيد (FIFO) ويُثبّت سعر البيع لحساب الربح المحقق.",
                  bg=CARD, fg=MUT, font=("Segoe UI", 8)).pack(anchor="e", padx=10)
 
     # ---------- التنبيهات ----------
@@ -934,8 +1013,8 @@ class GoldApp:
     # ---------- تصدير Excel ----------
     def export_excel(self):
         from tkinter import filedialog
-        if not self.holdings:
-            messagebox.showinfo("تصدير Excel", "لا توجد عمليات شراء لتصديرها.")
+        if not self.holdings and not self.sells:
+            messagebox.showinfo("تصدير Excel", "لا توجد عمليات لتصديرها.")
             return
         default = "محفظة_الذهب_{}.xlsx".format(datetime.now().strftime("%Y%m%d_%H%M"))
         path = filedialog.asksaveasfilename(
@@ -955,38 +1034,43 @@ class GoldApp:
         t_cost = t_val = 0.0
         t_qty_g = 0.0
         realized = 0.0
+        # المراكز المفتوحة (الرصيد المتبقي)
         for h in self.holdings:
             unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
             cost_disp = h["qty"] * h["buy"] * self.rate()
-            if h.get("sell") is not None:
-                sell_disp = h["sell"] * self.rate()
-                value_disp = h["qty"] * sell_disp
-                pl = value_disp - cost_disp
-                pct = (pl / cost_disp * 100) if cost_disp else 0
-                realized += pl
-                rows.append([
-                    h["name"], "مباع", round(h["qty"], 6), unit_txt,
-                    round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
-                    round(sell_disp, 3), round(value_disp, 3),
-                    round(pl, 3), round(pct, 2),
-                ])
-            else:
-                cur_disp = self.current_per_unit_disp(h["unit"])
-                value_disp = h["qty"] * cur_disp
-                pl = value_disp - cost_disp
-                pct = (pl / cost_disp * 100) if cost_disp else 0
-                t_cost += cost_disp
-                t_val += value_disp
-                t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
-                rows.append([
-                    h["name"], "مفتوح", round(h["qty"], 6), unit_txt,
-                    round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
-                    round(cur_disp, 3), round(value_disp, 3),
-                    round(pl, 3), round(pct, 2),
-                ])
+            cur_disp = self.current_per_unit_disp(h["unit"])
+            value_disp = h["qty"] * cur_disp
+            pl = value_disp - cost_disp
+            pct = (pl / cost_disp * 100) if cost_disp else 0
+            t_cost += cost_disp
+            t_val += value_disp
+            t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
+            rows.append([
+                h["name"], "مفتوح", round(h["qty"], 6), unit_txt,
+                round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
+                round(cur_disp, 3), round(value_disp, 3),
+                round(pl, 3), round(pct, 2),
+            ])
+        # عمليات البيع المحققة
+        for s in self.sells:
+            qty_g = s["qty_g"]
+            cost_disp = s["cost"] * self.rate()
+            sell_disp = s["sell"] * self.rate()
+            value_disp = qty_g * sell_disp
+            pl = value_disp - cost_disp
+            pct = (pl / cost_disp * 100) if cost_disp else 0
+            realized += pl
+            buy_per_g_disp = (cost_disp / qty_g) if qty_g else 0.0
+            rows.append([
+                "{} ({})".format(s.get("name", "بيع ذهب"), s.get("date", "")),
+                "مباع", round(qty_g, 6), "غرام",
+                round(buy_per_g_disp, 3), round(cost_disp, 3),
+                round(sell_disp, 3), round(value_disp, 3),
+                round(pl, 3), round(pct, 2),
+            ])
         t_pl = t_val - t_cost
         t_pct = (t_pl / t_cost * 100) if t_cost else 0
-        rows.append(["∑ المفتوح (غير محقق)", "", round(t_qty_g, 3), "غرام",
+        rows.append(["∑ الرصيد المتبقي (غير محقق)", "", round(t_qty_g, 3), "غرام",
                      "", round(t_cost, 3), "", round(t_val, 3),
                      round(t_pl, 3), round(t_pct, 2)])
         rows.append(["∑ الربح المحقق (المباع)", "", "", "",
@@ -999,7 +1083,7 @@ class GoldApp:
             messagebox.showerror("تصدير Excel", "تعذّر حفظ الملف:\n{}".format(e))
             return
         messagebox.showinfo("تصدير Excel",
-                            "تم تصدير {} سجل بنجاح.".format(len(self.holdings)))
+                            "تم تصدير {} سجل بنجاح.".format(len(self.holdings) + len(self.sells)))
 
     # ---------- نافذة تنبيه السعر (مستقلة) ----------
     def open_alerts(self):
@@ -1081,6 +1165,7 @@ class GoldApp:
         try:
             new_price, source = fetch_spot_usd(self.source_mode)
             old_price = self.spot_oz_usd
+            self._delta_oz = (new_price - old_price) if old_price else 0.0
             if old_price and new_price > old_price:
                 direction = "up"
             elif old_price and new_price < old_price:
@@ -1166,68 +1251,74 @@ class GoldApp:
     def render(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
+        self.row_map = {}
         t_cost = t_val = 0.0
-        t_qty_g = 0.0            # إجمالي الكمية محوّلة إلى غرام (المراكز المفتوحة فقط)
+        t_qty_g = 0.0            # إجمالي الكمية المتبقية (غرام)
         realized = 0.0          # إجمالي الربح/الخسارة المحقق (المباع)
         sym = CUR[self.cur]["sym"]
+        rowi = 0
+        # ===== المراكز المفتوحة (الرصيد المتبقي) =====
         for idx, h in enumerate(self.holdings):
             unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
             cost_usd = h["qty"] * h["buy"]
             cost_disp = cost_usd * self.rate()
-            stripe = "odd" if idx % 2 else "even"
-            sold_price = h.get("sell")
-            if sold_price is not None:
-                # ===== مركز مباع → ربح/خسارة محقق =====
-                sell_disp = sold_price * self.rate()
-                value_disp = h["qty"] * sell_disp
-                pl = value_disp - cost_disp
-                pct = (pl / cost_disp * 100) if cost_disp else 0
-                realized += pl
-                tag = "pos" if pl > 0 else ("neg" if pl < 0 else "")
-                row_tags = (tag, "sold") if tag else ("sold",)
-                self.tree.insert("", "end", tags=row_tags, values=(
-                    h["name"],
-                    "✔ مباع",
-                    "{:g} {}".format(h["qty"], unit_txt),
-                    "{}{:,.2f}".format(sym, h["buy"] * self.rate()),
-                    "{}{:,.2f}".format(sym, cost_disp),
-                    "{}{:,.2f}".format(sym, sell_disp),
-                    "{}{:,.2f}".format(sym, value_disp),
-                    "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
-                    "{}{:.2f}%".format("+" if pl > 0 else "", pct),
-                ))
-            else:
-                # ===== مركز مفتوح → ربح/خسارة غير محقق =====
-                cur_disp = self.current_per_unit_disp(h["unit"])
-                value_disp = h["qty"] * cur_disp
-                pl = value_disp - cost_disp
-                pct = (pl / cost_disp * 100) if cost_disp else 0
-                t_cost += cost_disp
-                t_val += value_disp
-                t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
-                tag = "pos" if pl > 0 else ("neg" if pl < 0 else "")
-                row_tags = (tag, stripe) if tag else (stripe,)
-                self.tree.insert("", "end", tags=row_tags, values=(
-                    h["name"],
-                    "● مفتوح",
-                    "{:g} {}".format(h["qty"], unit_txt),
-                    "{}{:,.2f}".format(sym, h["buy"] * self.rate()),
-                    "{}{:,.2f}".format(sym, cost_disp),
-                    "{}{:,.2f}".format(sym, cur_disp),
-                    "{}{:,.2f}".format(sym, value_disp),
-                    "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
-                    "{}{:.2f}%".format("+" if pl > 0 else "", pct),
-                ))
+            cur_disp = self.current_per_unit_disp(h["unit"])
+            value_disp = h["qty"] * cur_disp
+            pl = value_disp - cost_disp
+            pct = (pl / cost_disp * 100) if cost_disp else 0
+            t_cost += cost_disp
+            t_val += value_disp
+            t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
+            tag = "pos" if pl > 0 else ("neg" if pl < 0 else "")
+            stripe = "odd" if rowi % 2 else "even"
+            row_tags = (tag, stripe) if tag else (stripe,)
+            iid = "h{}".format(idx)
+            self.row_map[iid] = ("hold", idx)
+            self.tree.insert("", "end", iid=iid, tags=row_tags, values=(
+                h["name"],
+                "● مفتوح",
+                "{:g} {}".format(h["qty"], unit_txt),
+                "{}{:,.2f}".format(sym, h["buy"] * self.rate()),
+                "{}{:,.2f}".format(sym, cost_disp),
+                "{}{:,.2f}".format(sym, cur_disp),
+                "{}{:,.2f}".format(sym, value_disp),
+                "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
+                "{}{:.2f}%".format("+" if pl > 0 else "", pct),
+            ))
+            rowi += 1
+        # ===== عمليات البيع (محققة — سطر أخضر بسعر بيع مثبّت) =====
+        for sidx, s in enumerate(self.sells):
+            qty_g = s["qty_g"]
+            cost_disp = s["cost"] * self.rate()
+            sell_disp = s["sell"] * self.rate()          # دولار/غرام × الصرف
+            value_disp = qty_g * sell_disp
+            pl = value_disp - cost_disp
+            pct = (pl / cost_disp * 100) if cost_disp else 0
+            realized += pl
+            buy_per_g_disp = (cost_disp / qty_g) if qty_g else 0.0
+            iid = "s{}".format(sidx)
+            self.row_map[iid] = ("sell", sidx)
+            self.tree.insert("", "end", iid=iid, tags=("soldgreen",), values=(
+                "💰 {}".format(s.get("name", "بيع ذهب")),
+                "✔ بيع",
+                "{:g} غرام".format(qty_g),
+                "{}{:,.2f}".format(sym, buy_per_g_disp),
+                "{}{:,.2f}".format(sym, cost_disp),
+                "{}{:,.2f}".format(sym, sell_disp),
+                "{}{:,.2f}".format(sym, value_disp),
+                "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
+                "{}{:.2f}%".format("+" if pl > 0 else "", pct),
+            ))
         self.update_price_labels()
         self.check_alerts()
         t_pl = t_val - t_cost
         t_pct = (t_pl / t_cost * 100) if t_cost else 0
         total_pl = t_pl + realized
-        # ===== سطر الإجمالي داخل الجدول (المراكز المفتوحة) =====
-        if any(h.get("sell") is None for h in self.holdings):
+        # ===== سطر إجمالي الرصيد المتبقي =====
+        if self.holdings:
             ttag = "totalpos" if t_pl > 0 else ("totalneg" if t_pl < 0 else "total")
             self.tree.insert("", "end", tags=(ttag,), values=(
-                "∑ المفتوح",
+                "∑ الرصيد المتبقي",
                 "-",
                 "{:,.2f} غرام".format(t_qty_g),
                 "-",
@@ -1238,7 +1329,7 @@ class GoldApp:
                 "{}{:.2f}%".format("+" if t_pl > 0 else "", t_pct),
             ))
         self.lbl_sum.config(
-            text=("الربح المحقق: {sg_r}{s}{r:,.2f}    |    غير المحقق: {sg_u}{s}{u:,.2f}    |    الإجمالي: {sg_t}{s}{tp:,.2f}").format(
+            text=("الربح المحقق: {sg_r}{s}{r:,.2f}    |    غير المحقق: {sg_u}{s}{u:,.2f}    |    إجمالي الربح/الخسارة: {sg_t}{s}{tp:,.2f}").format(
                 s=sym, r=realized, u=t_pl, tp=total_pl,
                 sg_r="+" if realized > 0 else "",
                 sg_u="+" if t_pl > 0 else "",
@@ -1253,9 +1344,33 @@ class GoldApp:
             self.lbl_gr.config(text="{}{:,.3f}".format(sym, self.gram_market_disp()))
             self.lbl_gr_buy.config(text="{}{:,.3f}".format(sym, self.gram_buy_disp()))
             self.lbl_gr_adj.config(text="{}{:,.3f}".format(sym, self.gram_eff_disp()))
+            self._update_delta_indicator()
         else:
             for lbl in (self.lbl_oz, self.lbl_gr, self.lbl_gr_buy, self.lbl_gr_adj):
                 lbl.config(text="--")
+
+    def _update_delta_indicator(self):
+        """مؤشر تغيّر سعر الغرام السوقي منذ آخر تحديث."""
+        lbl = getattr(self, "lbl_delta", None)
+        if lbl is None:
+            return
+        t = self.theme
+        sym = CUR[self.cur]["sym"]
+        delta_oz = getattr(self, "_delta_oz", 0.0) or 0.0
+        if abs(delta_oz) < 1e-9 or not self.spot_oz_usd:
+            lbl.config(text="━ ثابت", fg=t.get("flash_same", "#ffd93b"))
+            return
+        gram_delta_disp = (delta_oz / OZ_TO_G) * self.rate()
+        prev_oz = self.spot_oz_usd - delta_oz
+        pct = (delta_oz / prev_oz * 100) if prev_oz else 0.0
+        if delta_oz > 0:
+            arrow, color = "▲", t.get("profit", "#2ecc71")
+        else:
+            arrow, color = "▼", t.get("loss", "#ff5c5c")
+        lbl.config(
+            text="{a} {sym}{d:,.3f}/غ ({p:+.2f}%)".format(
+                a=arrow, sym=sym, d=abs(gram_delta_disp), p=pct),
+            fg=color)
 
 
 def main():
