@@ -1,290 +1,1250 @@
 # -*- coding: utf-8 -*-
 """
-محفظة الذهب — تطبيق ويندوز (Gold Portfolio for Windows)
-- يجلب سعر الذهب الحالي مباشرة من الإنترنت
-- يحسب الربح/الخسارة بمقارنة سعر الشراء بسعر السوق
-- تحويل العملة تلقائياً (USD / SAR / AED)
-- يطرح مقداراً ثابتاً (افتراضي 5.22) من سعر الغرام الحالي
-يعتمد فقط على المكتبة القياسية لبايثون (لا توجد حزم خارجية).
+محفظة الذهب — Gold Portfolio
+تطبيق سطح مكتب (Tkinter) لتتبّع محفظة الذهب: شراء / بيع / ربح وخسارة /
+حاسبة زكاة / سجل عمليات / مخطط سعر الغرام. يعمل بمكتبة بايثون القياسية فقط
+(التصدير إلى Excel اختياري إن توفّر openpyxl).
 """
-import json
 import os
-import threading
+import json
 import time
-import urllib.request
-import xml.sax.saxutils as _xml
-import zipfile
+import hashlib
+import hmac
+import shutil
+import threading
+import math
+import re
+import sys
+import glob
+import base64
+import subprocess
+import tempfile
 from datetime import datetime
-
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, colorchooser, filedialog
+import urllib.request
 
-OZ_TO_G = 31.1034768
-# المصدر الأساسي (نفس مصدر livepriceofgold - تحديث لحظي)
-GOLDPRICE_URL = "https://data-asg.goldprice.org/dbXRates/USD"
-# مصدر فوري موثوق (سعر فوري بدقة عالية، بدون مفتاح)
-SWISS_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
-# احتياطي 1
-YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
-# احتياطي 2
-GOLD_URL = "https://api.gold-api.com/price/XAU"
-FX_URL = "https://open.er-api.com/v6/latest/USD"
-DATA_FILE = os.path.join(os.path.expanduser("~"), "gold_portfolio_data.json")
+# ============================ ثوابت عامة ============================
+OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
+HOME_DIR = os.path.expanduser("~")
+# ملف واحد للبيانات القديمة (قبل نظام الحسابات) — يُتبنّى عند إنشاء أول حساب
+DATA_FILE = os.path.join(HOME_DIR, "gold_portfolio_data.json")
+# ملف الحسابات (أسماء المستخدمين + بصمات كلمات المرور)
+USERS_FILE = os.path.join(HOME_DIR, "gold_portfolio_users.json")
+# تفضيلات بسيطة (اسم المستخدم المتذكّر فقط — لا تُحفظ كلمة المرور أبداً)
+PREFS_FILE = os.path.join(HOME_DIR, "gold_portfolio_prefs.json")
 
+
+def load_prefs():
+    try:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_prefs(prefs):
+    try:
+        tmp = PREFS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, PREFS_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def user_data_file(username):
+    """ملف بيانات مستقل لكل مستخدم (لا يرى أحد بيانات غيره)."""
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in (username or ""))
+    return os.path.join(HOME_DIR, "gold_portfolio_data_{}.json".format(safe.lower() or "user"))
+
+
+def load_users():
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_users(users):
+    try:
+        tmp = USERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(users, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, USERS_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def hash_password(password, salt_hex=None):
+    """بصمة كلمة المرور بـ PBKDF2-SHA256 مع ملح عشوائي (لا تُخزَّن كلمة المرور أبداً)."""
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200000)
+    return salt.hex(), dk.hex()
+
+
+def verify_password(password, salt_hex, hash_hex):
+    try:
+        _, calc = hash_password(password, salt_hex)
+        return hmac.compare_digest(calc, hash_hex or "")
+    except Exception:
+        return False
+
+# العملات المدعومة (أُزيل الدرهم الإماراتي وأُضيف الدينار الأردني)
 CUR = {
-    "USD": {"sym": "$", "name": "USD", "label": "دولار أمريكي (USD)"},
-    "SAR": {"sym": "ر.س ", "name": "SAR", "label": "ريال سعودي (SAR)"},
-    "AED": {"sym": "د.إ ", "name": "AED", "label": "درهم إماراتي (AED)"},
+    "USD": {"name": "دولار أمريكي", "sym": "$"},
+    "SAR": {"name": "ريال سعودي", "sym": "ر.س "},
+    "JOD": {"name": "دينار أردني", "sym": "د.أ "},
+    "KWD": {"name": "دينار كويتي", "sym": "د.ك "},
+    "QAR": {"name": "ريال قطري", "sym": "ر.ق "},
+    "EGP": {"name": "جنيه مصري", "sym": "ج.م "},
 }
-DEFAULT_RATES = {"USD": 1.0, "SAR": 3.75, "AED": 3.6725}
+# أسعار صرف تقريبية مقابل الدولار (تُحدّث تلقائياً من الإنترنت)
+DEFAULT_RATES = {"USD": 1.0, "SAR": 3.75, "JOD": 0.709, "KWD": 0.306,
+                 "QAR": 3.64, "EGP": 48.5}
 
-# نسخة سمة الألوان — عند زيادتها تُطبَّق السمة الحديثة الجديدة
-# حتى لو كان لدى المستخدم سمة قديمة محفوظة.
-THEME_VER = 3
+UNIT_MAP = {"غرام": "g", "أونصة": "oz"}
+UNIT_REV = {"g": "غرام", "oz": "أونصة"}
+
+# العيارات المدعومة (ذهب خالص = 24)
+KARATS = (24, 22, 21, 18)
+
+# النطاقات الزمنية للمخطط: (المفتاح، الاسم، عدد الثواني)
+CHART_RANGES = (("hour", "ساعة", 3600),
+                ("day", "يوم", 86400),
+                ("week", "أسبوع", 7 * 86400))
+
+
+def karat_factor(karat):
+    """معامل نقاوة العيار نسبةً إلى الذهب الخالص 24."""
+    try:
+        k = float(karat)
+    except (TypeError, ValueError):
+        k = 24.0
+    return k / 24.0
 
 DEFAULT_THEME = {
-    "bg": "#0b0e14",        # الخلفية العامة (أزرق-رمادي داكن حديث)
-    "card": "#151a23",      # البطاقات
-    "card2": "#1e2530",     # خلفية ثانوية / مرتفعة
-    "accent": "#e3b23c",    # اللون المميز (ذهبي راقٍ)
-    "accent_text": "#141000",
-    "text": "#eef1f6",      # النص الأساسي
-    "muted": "#8b94a7",     # نص ثانوي
-    "profit": "#2ecc71",    # لون الربح
-    "loss": "#ff5c5c",      # لون الخسارة
-    "total": "#ffffff",     # لون سطر الإجمالي
-    "total_bg": "#232b38",
-    "border": "#2a3240",    # حدود خفيفة
-    "entry_bg": "#1b2029",  # خلفية حقول الإدخال
-    "row_alt": "#171c26",   # تظليل الصفوف المتناوبة
-    "hover": "#f0c954",     # لون التمرير على الزر الذهبي
-    "flash_same": "#ffd93b", # وميض أصفر عند ثبات السعر
-    "sold_bg": "#16351f",   # خلفية سطر عملية البيع (أخضر داكن)
+    "bg": "#0a0c11",
+    "card": "#12161e",
+    "card2": "#1a2029",
+    "accent": "#e9c684",
+    "accent_text": "#151008",
+    "text": "#eef2f9",
+    "muted": "#9ba6ba",
+    "profit": "#3ddc97",
+    "loss": "#ff6b6b",
+    "total": "#ffffff",
+    "total_bg": "#1b2230",
+    "border": "#252c39",
+    "entry_bg": "#151a23",
+    "row_alt": "#141922",
+    "hover": "#f3d8a5",
+    "flash_same": "#ffd93b",
+    "sold_bg": "#12301f",
+}
+LIGHT_THEME = {
+    "bg": "#f4f6fa",
+    "card": "#ffffff",
+    "card2": "#e9eef7",
+    "accent": "#a8761d",
+    "accent_text": "#ffffff",
+    "text": "#161b26",
+    "muted": "#46536b",
+    "profit": "#0f8a4f",
+    "loss": "#c62828",
+    "total": "#0b1220",
+    "total_bg": "#eef1f7",
+    "border": "#d7dde9",
+    "entry_bg": "#ffffff",
+    "row_alt": "#f5f7fb",
+    "hover": "#c9922e",
+    "flash_same": "#b8860b",
+    "sold_bg": "#e6f6ec",
 }
 DEFAULT_TITLES = {
     "title": "✦ محفظة الذهب ✦",
     "subtitle": "تتبّع الربح والخسارة مع جلب السعر مباشرة من الإنترنت",
     "window": "محفظة الذهب - Gold Portfolio",
 }
+THEME_VER = 5
+
+# كثافة شاشة ويندوز (96 = 100%). تُضبط عند الإقلاع لدعم شاشات 125% و150%.
+SYSTEM_DPI = 96
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/122.0 Safari/537.36")
 
 
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
-)
-
-
-def http_json(url, timeout=10, headers=None):
-    hdrs = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*",
-            "Cache-Control": "no-cache", "Pragma": "no-cache"}
-    if headers:
-        hdrs.update(headers)
-    req = urllib.request.Request(url, headers=hdrs)
+# ============================ أدوات مساعدة ============================
+def http_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA,
+                                              "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+        return json.loads(r.read().decode("utf-8", "ignore"))
 
 
-def _bust(url):
-    """يضيف طابعاً زمنياً لمنع التخزين المؤقت (ضمان سعر طازج كل مرة)."""
-    sep = "&" if "?" in url else "?"
-    return "{}{}_t={}".format(url, sep, int(time.time() * 1000))
-
-
-def market_closed():
-    """يرجع True إذا كان سوق الذهب الفوري مغلقاً (عطلة نهاية الأسبوع).
-    السوق يفتح الأحد 22:00 UTC ويغلق الجمعة 22:00 UTC تقريباً.
-    خلال الإغلاق تبقى الأسعار ثابتة عند سعر إغلاق الجمعة (وليس خللاً).
-    """
-    now = datetime.utcnow()
-    wd = now.weekday()   # الاثنين=0 ... الأحد=6
-    h = now.hour
-    if wd == 5:                 # السبت كاملاً
-        return True
-    if wd == 6 and h < 22:      # الأحد قبل 22:00 UTC
-        return True
-    if wd == 4 and h >= 22:     # الجمعة بعد 22:00 UTC
-        return True
-    return False
-
-
-def _src_goldprice():
-    d = http_json(_bust(GOLDPRICE_URL), timeout=7,
-                  headers={"Referer": "https://goldprice.org/"})
-    items = d.get("items") or []
-    if items and items[0].get("xauPrice"):
-        return float(items[0]["xauPrice"])
-    raise ValueError("no data")
-
-
-def _src_swissquote():
-    d = http_json(_bust(SWISS_URL), timeout=7)
-    for block in d:
-        for sp in block.get("spreadProfilePrices", []):
-            bid, ask = sp.get("bid"), sp.get("ask")
-            if bid and ask:
-                return (float(bid) + float(ask)) / 2.0
-    raise ValueError("no data")
-
-
-def _src_yahoo():
-    d = http_json(_bust(YAHOO_URL), timeout=7)
-    meta = d["chart"]["result"][0]["meta"]
-    p = meta.get("regularMarketPrice")
-    if p:
-        return float(p)
-    raise ValueError("no data")
-
-
-def _src_goldapi():
-    d = http_json(_bust(GOLD_URL), timeout=7)
-    return float(d["price"])
-
-
-# المصادر المتاحة: المفتاح -> (الاسم العربي للعرض، الدالة)
-SOURCES = {
-    "goldprice":  ("goldprice — مطابق livepriceofgold", _src_goldprice),
-    "swissquote": ("swissquote — فوري دقيق", _src_swissquote),
-    "yahoo":      ("yahoo — عقد آجل (أعلى قليلاً)", _src_yahoo),
-    "gold-api":   ("gold-api — تقريبي (احتياطي)", _src_goldapi),
-}
-AUTO_ORDER = ["goldprice", "swissquote", "yahoo", "gold-api"]
+def _http_text(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "ignore")
 
 
 def fetch_spot_usd(mode="auto"):
-    """يرجع (سعر الأونصة بالدولار، اسم المصدر).
-    mode="auto" يجرّب المصادر بالترتيب؛ أو اسم مصدر محدد لإجباره.
-    عند فشل المصدر المحدد يسقط تلقائياً لباقي المصادر لمنع تجمّد الشاشة.
-    """
-    if mode and mode != "auto" and mode in SOURCES:
+    """جلب سعر أونصة الذهب بالدولار من عدة مصادر مجانية."""
+    sources = [
+        ("gold-api", lambda: http_json("https://api.gold-api.com/price/XAU").get("price")),
+        ("goldprice.org", lambda: http_json(
+            "https://data-asg.goldprice.org/dbXRates/USD")["items"][0]["xauPrice"]),
+        ("stooq", lambda: float(
+            _http_text("https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv"
+                       ).strip().splitlines()[-1].split(",")[6])),
+    ]
+    if mode and mode != "auto":
+        sources = [s for s in sources if s[0] == mode] or sources
+    last_err = None
+    for name, fn in sources:
         try:
-            return SOURCES[mode][1](), mode
-        except Exception:
-            pass  # سقوط تلقائي لباقي المصادر
-    for key in AUTO_ORDER:
+            val = fn()
+            if val and float(val) > 0:
+                return float(val), name
+        except Exception as e:  # noqa
+            last_err = e
+            continue
+    raise RuntimeError("تعذّر جلب السعر: {}".format(last_err))
+
+
+def market_closed():
+    """سوق الذهب العالمي مغلق (السبت والأحد المبكر)."""
+    wd = datetime.utcnow().weekday()   # 0=الاثنين ... 5=السبت 6=الأحد
+    return wd == 5 or (wd == 6 and datetime.utcnow().hour < 22)
+
+
+# ==================== أيقونة التطبيق (مضمّنة داخل الملف) ====================
+# صورة ICO لعملة ذهبية، مضمّنة كنص Base64 حتى يعمل الملف وحده دون ملفات مساعدة.
+APP_ICON_ICO_B64 = (
+    "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"
+)
+
+
+def app_icon_path():
+    """يكتب الأيقونة في ملف مؤقت (أو يستخدم app.ico المجاور) ويعيد مسارها."""
+    cached = getattr(app_icon_path, "_cached", "unset")
+    if cached != "unset":
+        return cached
+    path = None
+    here = ""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        here = ""
+    for cand in (os.path.join(here, "app.ico") if here else "",
+                 os.path.join(getattr(sys, "_MEIPASS", "") or "", "app.ico")):
         try:
-            return SOURCES[key][1](), key
+            if cand and os.path.isfile(cand) and os.path.getsize(cand) > 1500:
+                path = cand
+                break
         except Exception:
             continue
-    raise RuntimeError("تعذّر جلب السعر من جميع المصادر")
+    if path is None:
+        try:
+            base = os.path.join(os.environ.get("LOCALAPPDATA")
+                                or tempfile.gettempdir(), "GoldPortfolio")
+            os.makedirs(base, exist_ok=True)
+            p = os.path.join(base, "app.ico")
+            if (not os.path.isfile(p)) or os.path.getsize(p) < 1500:
+                with open(p, "wb") as f:
+                    f.write(base64.b64decode(APP_ICON_ICO_B64))
+            path = p
+        except Exception:
+            path = None
+    app_icon_path._cached = path
+    return path
 
 
-def _col_letter(idx):
-    """رقم عمود (1-مبدوء) -> حرف Excel (A, B, ... AA)."""
-    s = ""
-    while idx > 0:
-        idx, r = divmod(idx - 1, 26)
-        s = chr(65 + r) + s
-    return s
+class ScrollArea(tk.Frame):
+    """منطقة تمرير عمودي: Canvas + إطار داخلي + شريط يظهر عند الحاجة فقط.
+    الهدف: تظهر كل محتويات الصفحة مهما كان ارتفاع الشاشة، بلا أي قصّ.
+    التمرير بمقدار ثابت بالبكسل (سلس) ويعمل بالعجلة وبلوحة المفاتيح."""
+
+    def __init__(self, parent, bg="#10141b", bar_side="left", step=24):
+        super().__init__(parent, bg=bg)
+        self._bar_on = True
+        try:
+            sc = float(self.tk.call("tk", "scaling")) / 1.3333
+        except Exception:
+            sc = 1.0
+        self._step = max(14, int(round(step * max(0.75, sc))))
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
+                                takefocus=1, yscrollincrement=self._step)
+        self.vbar = ttk.Scrollbar(self, orient="vertical",
+                                  command=self.canvas.yview)
+        try:
+            self.canvas.configure(yscrollcommand=self._on_scroll)
+        except Exception:
+            pass
+        self.vbar.pack(side=bar_side, fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._win = self.canvas.create_window((0, 0), window=self.inner,
+                                              anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
+        self._bind_keys()
+
+    def _bind_keys(self):
+        """لوحة المفاتيح بعد النقر على المساحة الفارغة من الصفحة."""
+        pairs = (("<Prior>", lambda e: self.scroll_pages(-1)),
+                 ("<Next>", lambda e: self.scroll_pages(1)),
+                 ("<Home>", lambda e: self.to_top()),
+                 ("<End>", lambda e: self.to_bottom()),
+                 ("<Up>", lambda e: self.scroll_units(-1)),
+                 ("<Down>", lambda e: self.scroll_units(1)))
+        for seq, fn in pairs:
+            try:
+                self.canvas.bind(seq, fn)
+            except Exception:
+                pass
+        try:
+            self.inner.bind("<Button-1>",
+                            lambda e: self.canvas.focus_set(), add="+")
+        except Exception:
+            pass
+
+    # ---------------- داخلي ----------------
+    def _on_inner(self, _e=None):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+        self._autohide()
+
+    def _on_canvas(self, event=None):
+        try:
+            if event is not None:
+                self.canvas.itemconfigure(self._win, width=max(1, event.width))
+        except Exception:
+            pass
+        self._autohide()
+
+    def _on_scroll(self, first, last):
+        try:
+            self.vbar.set(first, last)
+        except Exception:
+            pass
+        try:
+            need = not (float(first) <= 0.001 and float(last) >= 0.999)
+        except Exception:
+            need = True
+        self._toggle_bar(need)
+
+    def _toggle_bar(self, need):
+        if need == self._bar_on:
+            return
+        self._bar_on = need
+        try:
+            if need:
+                self.vbar.pack(side="left", fill="y", before=self.canvas)
+            else:
+                self.vbar.pack_forget()
+        except Exception:
+            pass
+
+    def _autohide(self):
+        try:
+            y0, y1 = self.canvas.yview()
+            need = (y1 - y0) < 0.999
+        except Exception:
+            return
+        self._toggle_bar(need)
+
+    # ---------------- واجهة ----------------
+    def scroll_units(self, n, horizontal=False):
+        try:
+            if horizontal:
+                self.canvas.xview_scroll(int(n), "units")
+            else:
+                self.canvas.yview_scroll(int(n), "units")
+            return "break"
+        except Exception:
+            return None
+
+    def scroll_pages(self, n):
+        try:
+            self.canvas.yview_scroll(int(n), "pages")
+        except Exception:
+            pass
+        return "break"
+
+    def to_top(self):
+        try:
+            self.canvas.yview_moveto(0)
+        except Exception:
+            pass
+        return "break"
+
+    def to_bottom(self):
+        try:
+            self.canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+        return "break"
+
+    def refresh(self):
+        self._on_inner()
 
 
-def write_xlsx(path, headers, rows, sheet_name="المحفظة"):
-    """يكتب ملف Excel (.xlsx) صحيحاً باستخدام المكتبة القياسية فقط.
-    headers: قائمة نصوص. rows: قائمة صفوف؛ كل خلية نص أو رقم.
-    """
-    def esc(v):
-        return _xml.escape(str(v))
+class PriceWidget:
+    """ويدجيت عائم صغير (دائماً في المقدمة) يعرض جنباً إلى جنب:
+    سعر شراء الغرام بالريال السعودي | سعر الشراء بالدينار الأردني |
+    القيمة الحالية للمحفظة. يُسحب بالماوس، يحفظ موضعه، ويُغلق بـ ✕ أو F9."""
 
-    def cell_xml(ref, value):
-        if isinstance(value, bool):
-            value = str(value)
-        if isinstance(value, (int, float)):
-            return '<c r="{r}"><v>{v}</v></c>'.format(r=ref, v=value)
-        return ('<c r="{r}" t="inlineStr"><is><t xml:space="preserve">'
-                '{v}</t></is></c>').format(r=ref, v=esc(value))
+    WIDTH = 340
 
-    all_rows = [headers] + list(rows)
-    rows_xml = []
-    for ri, rowvals in enumerate(all_rows, start=1):
-        cells = "".join(
-            cell_xml(_col_letter(ci) + str(ri), val)
-            for ci, val in enumerate(rowvals, start=1))
-        rows_xml.append('<row r="{r}">{c}</row>'.format(r=ri, c=cells))
-    sheet = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<sheetData>{}</sheetData></worksheet>'.format("".join(rows_xml)))
+    def __init__(self, app):
+        self.app = app
+        t = app.theme
+        self.card = t.get("card", "#12161e")
+        self.accent = t.get("accent", "#e9c684")
+        self.text = t.get("text", "#e8edf7")
+        self.muted = t.get("muted", "#9ba6ba")
+        self.profit = t.get("profit", "#2ecc71")
+        self.loss = t.get("loss", "#ff5c5c")
+        self.border = t.get("border", "#252c39")
+        self._dx = self._dy = 0
+        try:
+            self.width = app._px(self.WIDTH)
+        except Exception:
+            self.width = self.WIDTH
 
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        '</Types>')
-    root_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-        '</Relationships>')
-    workbook = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        '<sheets><sheet name="{n}" sheetId="1" r:id="rId1"/></sheets>'
-        '</workbook>'.format(n=esc(sheet_name)))
-    wb_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-        '</Relationships>')
+        self.win = tk.Toplevel(app.root)
+        try:
+            self.win.overrideredirect(True)
+        except Exception:
+            pass
+        try:
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            self.win.configure(bg=self.accent)
+        except Exception:
+            pass
+        self._build()
+        try:
+            self.win.update_idletasks()
+            h = int(self.win.winfo_reqheight() or 76)
+            self.win.geometry("{}x{}".format(self.width, max(h, app._px(72))))
+        except Exception:
+            pass
+        self._restore_geo()
+        self._bind_drag()
+        self.refresh()
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", content_types)
-        z.writestr("_rels/.rels", root_rels)
-        z.writestr("xl/workbook.xml", workbook)
-        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
-        z.writestr("xl/worksheets/sheet1.xml", sheet)
+    # ---------------- البناء ----------------
+    def _mini(self, parent, text, cmd, size=10):
+        return tk.Button(parent, text=text, command=cmd, bg=self.card,
+                         fg=self.muted, activebackground=self.border,
+                         activeforeground=self.accent, relief="flat", bd=0,
+                         padx=6, pady=0, cursor="hand2",
+                         font=("Segoe UI", size, "bold"))
+
+    def _build(self):
+        """شريط صغير: البيانات الثلاثة بجانب بعضها (أعمدة) لا فوق بعضها."""
+        px = self.app._px
+        outer = tk.Frame(self.win, bg=self.accent)
+        outer.pack(fill="both", expand=True, padx=1, pady=1)
+        body = tk.Frame(outer, bg=self.card)
+        body.pack(fill="both", expand=True, padx=px(8), pady=px(4))
+        self.body = body
+
+        # -------- شريط علوي مضغوط: العنوان + العيار + تحديث + إغلاق --------
+        head = tk.Frame(body, bg=self.card)
+        head.pack(fill="x")
+        tk.Label(head, text="الراجحي", bg=self.card, fg=self.accent,
+                 font=("Segoe UI", 10, "bold")).pack(side="right")
+        self._mini(head, "✕", self.app.close_widget).pack(side="left")
+        self._mini(head, "⟳", self.app.refresh_all).pack(
+            side="left", padx=(0, px(2)))
+        self._mini(head, "+", lambda: self.app.widget_karat_step(1)).pack(
+            side="left")
+        self._mini(head, "−", lambda: self.app.widget_karat_step(-1)).pack(
+            side="left", padx=(px(3), 0))
+        self.lbl_karat = tk.Label(head, text="24", bg=self.card,
+                                  fg=self.accent,
+                                  font=("Segoe UI", 10, "bold"))
+        self.lbl_karat.pack(side="left", padx=px(2))
+        tk.Label(head, text="عيار", bg=self.card, fg=self.muted,
+                 font=("Segoe UI", 10)).pack(side="left")
+
+        tk.Frame(body, bg=self.border, height=1).pack(fill="x",
+                                                     pady=(px(2), px(3)))
+
+        # -------- ثلاثة أعمدة بجانب بعضها: شراء ر.س | شراء د.أ | القيمة --------
+        strip = tk.Frame(body, bg=self.card)
+        strip.pack(fill="x")
+        self.v_sar = self._cell(strip, "شراء (ر.س)")
+        self._vsep(strip)
+        self.v_jod = self._cell(strip, "شراء (د.أ)")
+        self._vsep(strip)
+        self.v_val = self._cell(strip, "القيمة الحالية", color=self.accent,
+                                big=True)
+        self.cols = strip
+
+    def _cell(self, parent, title, color=None, big=False):
+        """عمود صغير: العنوان فوق القيمة، بداخل الشريط الأفقي."""
+        px = self.app._px
+        fr = tk.Frame(parent, bg=self.card)
+        fr.pack(side="right", padx=px(4), pady=px(1))
+        tk.Label(fr, text=title, bg=self.card, fg=self.muted,
+                 font=("Segoe UI", 10)).pack()
+        val = tk.Label(fr, text="--", bg=self.card, fg=color or self.text,
+                       font=("Segoe UI", 13 if big else 12, "bold"))
+        val.pack()
+        return val
+
+    def _vsep(self, parent):
+        """فاصل رأسي رفيع بين الأعمدة."""
+        px = self.app._px
+        tk.Frame(parent, bg=self.border, width=1).pack(side="right",
+                                                       fill="y",
+                                                       padx=px(2))
+
+    # ---------------- السحب وحفظ الموضع ----------------
+    def _bind_drag(self):
+        def walk(w):
+            try:
+                kids = w.winfo_children()
+            except Exception:
+                kids = []
+            for c in kids:
+                if isinstance(c, tk.Button):
+                    continue
+                for seq, fn in (("<ButtonPress-1>", self._drag_start),
+                                ("<B1-Motion>", self._drag_move)):
+                    try:
+                        c.bind(seq, fn, add="+")
+                    except Exception:
+                        pass
+                walk(c)
+        walk(self.win)
+
+    def _drag_start(self, e):
+        try:
+            self._dx = e.x_root - self.win.winfo_x()
+            self._dy = e.y_root - self.win.winfo_y()
+        except Exception:
+            self._dx = self._dy = 0
+
+    def _drag_move(self, e):
+        try:
+            x = e.x_root - self._dx
+            y = e.y_root - self._dy
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            x = max(-20, min(int(x), sw - 120))
+            y = max(0, min(int(y), sh - 60))
+            self.win.geometry("+{}+{}".format(x, y))
+            self.app._widget_geo = "+{}+{}".format(x, y)
+        except Exception:
+            pass
+
+    def _restore_geo(self):
+        geo = str(getattr(self.app, "_widget_geo", "") or "")
+        m = re.match(r"^([+-]?\d+)([+-]\d+)$", geo)
+        if m:
+            try:
+                x, y = int(m.group(1)), int(m.group(2))
+                sw = self.win.winfo_screenwidth()
+                sh = self.win.winfo_screenheight()
+                x = max(-20, min(x, sw - 120))
+                y = max(0, min(y, sh - 60))
+                self.win.geometry("+{}+{}".format(x, y))
+                return
+            except Exception:
+                pass
+        try:
+            sw = self.win.winfo_screenwidth()
+            self.win.geometry("+{}+{}".format(
+                max(10, sw - self.width - self.app._px(26)), self.app._px(72)))
+        except Exception:
+            pass
+
+    # ---------------- التحديث ----------------
+    def refresh(self):
+        """يعرض: سعر الشراء بالريال، سعر الشراء بالدينار، والقيمة الحالية."""
+        hide = self.app._hide
+        try:
+            d = self.app.widget_prices()
+        except Exception:
+            d = None
+        if not d:
+            self.v_sar.config(text="--", fg=self.text)
+            self.v_jod.config(text="--", fg=self.text)
+            self.v_val.config(text="--")
+            self.lbl_karat.config(text=str(getattr(self.app, "karat", 24)))
+            return
+        prev = getattr(self, "_prev", None) or {}
+        for key, lbl in (("sar", self.v_sar), ("jod", self.v_jod)):
+            cur = d[key]
+            color = self.text
+            if key in prev:
+                if cur["buy"] > prev[key] + 1e-9:
+                    color = self.profit
+                elif cur["buy"] < prev[key] - 1e-9:
+                    color = self.loss
+            lbl.config(text=hide("{:,.3f}".format(cur["buy"])), fg=color)
+        self._prev = {"sar": d["sar"]["buy"], "jod": d["jod"]["buy"]}
+        try:
+            sym = CUR[self.app.cur]["sym"]
+            val = self.app.portfolio_value_disp()
+            self.v_val.config(text=hide("{}{:,.2f}".format(sym, val)))
+        except Exception:
+            self.v_val.config(text="--")
+        try:
+            self.lbl_karat.config(text=str(getattr(self.app, "karat", 24)))
+        except Exception:
+            pass
+
+    def copy_prices(self):
+        d = self.app.widget_prices()
+        if not d:
+            return
+        txt = ("سعر الغرام — عيار {k}\n"
+               "الريال السعودي (الراجحي): بيع {s1:,.3f} / شراء {s2:,.3f}\n"
+               "الدينار الأردني (الراجحي): بيع {j1:,.3f} / شراء {j2:,.3f}\n"
+               "الأونصة: ${oz:,.2f}   ·   {t}").format(
+            k=getattr(self.app, "karat", 24), t=self.app.last_update or "",
+            s1=d["sar"]["sell"], s2=d["sar"]["buy"],
+            j1=d["jod"]["sell"], j2=d["jod"]["buy"], oz=d["oz_usd"])
+        try:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(txt)
+        except Exception:
+            pass
+        try:
+            self.lbl_src.config(text="✔ نُسخ")
+            self.app.root.after(1500, lambda: self.lbl_src.config(text=""))
+        except Exception:
+            pass
+
+    # ---------------- الإغلاق ----------------
+    def destroy(self):
+        try:
+            geo = str(self.win.geometry() or "")
+            m = re.search(r"([+-]?\d+)([+-]\d+)$", geo)
+            if m:
+                self.app._widget_geo = "+{}+{}".format(int(m.group(1)),
+                                                        int(m.group(2)))
+        except Exception:
+            pass
+        try:
+            self.app.price_widget = None
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+
+def _ps_quote(text):
+    """تهيئة نص للاستخدام داخل أمر PowerShell بين علامتي اقتباس مفردتين."""
+    return str(text).replace("'", "''").replace("\r", " ").replace("\n", " ")
+
+
+def _win_toast(title, message):
+    """إشعار ويندوز الأصلي (Toast) عبر PowerShell وبدون أي نافذة ظاهرة."""
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] > $null;"
+        "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+        "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+        "$x=$t.GetElementsByTagName('text');"
+        "$x.Item(0).AppendChild($t.CreateTextNode('{0}')) > $null;"
+        "$x.Item(1).AppendChild($t.CreateTextNode('{1}')) > $null;"
+        "$n=[Windows.UI.Notifications.ToastNotification]::new($t);"
+        "$id='{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe';"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show($n);"
+    )
+    try:
+        ps = ps.format(_ps_quote(title), _ps_quote(message))
+        flags = 0x08000000 if os.name == "nt" else 0
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                        "-Command", ps],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=flags, timeout=15)
+        return True
+    except Exception:
+        return False
+
+
+def desktop_notify(title, message, app=None):
+    """إشعار سطح المكتب: Toast على ويندوز (في الخلفية بلا تجميد) +
+    بطاقة داخل التطبيق دائماً حتى لا يضيع التنبيه."""
+    if app is not None:
+        try:
+            app.toast(title, message)
+        except Exception:
+            pass
+    if os.name != "nt":
+        return False
+    try:
+        threading.Thread(target=_win_toast, args=(title, message),
+                         daemon=True).start()
+        return True
+    except Exception:
+        return False
+
+
+class PageBody(tk.Frame):
+    """إطار محتوى صفحة داخل النافذة، يحاكي واجهة النافذة المنفصلة (Toplevel)
+    حتى تعمل النوافذ القديمة كصفحات قابلة للتنقل."""
+
+    def __init__(self, parent, app, key, title_lbl):
+        super().__init__(parent, bg=app.theme["bg"])
+        self.app = app
+        self.page_key = key
+        self._title_lbl = title_lbl
+        self._back_cb = None
+
+    # ----- واجهة تشبه Toplevel -----
+    def title(self, *a):
+        if a and self._title_lbl is not None:
+            try:
+                self._title_lbl.config(text=str(a[0]))
+            except Exception:
+                pass
+
+    def geometry(self, *a):
+        pass
+
+    def transient(self, *a):
+        pass
+
+    def grab_set(self, *a):
+        pass
+
+    def grab_release(self, *a):
+        pass
+
+    def resizable(self, *a):
+        pass
+
+    def attributes(self, *a, **kw):
+        pass
+
+    def iconbitmap(self, *a, **kw):
+        pass
+
+    def protocol(self, name=None, fn=None):
+        if fn is not None:
+            self._back_cb = fn
+        return self._back_cb
+
+    def deiconify(self):
+        self.app._show_page(self.page_key)
+
+    def lift(self):
+        self.app._show_page(self.page_key)
+
+    def focus_set(self):
+        pass
+
+    def go_back(self):
+        """زر الرجوع: ينفّذ معالج الإغلاق إن وُجد ثم يعود للرئيسية."""
+        if callable(self._back_cb):
+            self._back_cb()
+        else:
+            self.app._close_page(self.page_key)
+
+    def destroy(self):
+        if getattr(self.app, "_closing_page", False):
+            return tk.Frame.destroy(self)
+        self.app._close_page(self.page_key)
 
 
 class GoldApp:
     def __init__(self, root):
         self.root = root
-        self.spot_oz_usd = 0.0            # سعر الأونصة بالدولار (الأساس)
+        self.spot_oz_usd = 0.0
         self.rates = dict(DEFAULT_RATES)
         self.cur = "USD"
-        self.adjust = 5.22               # فرق الراجحي للبيع (يُطرح من سعر الغرام العالمي)
-        self.buy_margin = 0.0            # فرق الراجحي للشراء (يُضاف لسعر الغرام العالمي)
-        self.holdings = []               # أسعار الشراء تُخزّن داخلياً بالدولار
-        self.sells = []                  # عمليات البيع المحققة (سعر بيع مثبّت)
-        self.history = []                # سجل كل العمليات (شراء/بيع)
-        self.price_hist = []             # عينات سعر الأونصة [epoch, oz_usd] خلال اليوم
-        self.alerts = []                 # تنبيهات الأسعار
+        self.karat = 24             # العيار الافتراضي للعرض والاحتماب
+        self.chart_range = "day"    # النطاق الزمني للمخطط: hour / day / week
+        self._pages = {}            # الصفحات الداخلية المفتوحة (زكاة، سجل، تنبيه، إعدادات، بيع)
+        self._closing_page = False
+        self.adjust = 5.22          # فرق الراجحي للبيع (يُطرح من سعر الغرام)
+        self.buy_margin = 0.0       # فرق الراجحي للشراء (يُضاف لسعر الغرام)
+        self.holdings = []          # عمليات الشراء المفتوحة (بالدولار داخلياً)
+        self.sells = []             # عمليات البيع المحققة (سعر بيع مثبّت)
+        self.history = []           # سجل كل العمليات
+        self.price_hist = []        # عينات السعر [epoch, oz_usd]
+        self.alerts = []
         self.theme = dict(DEFAULT_THEME)
         self.titles = dict(DEFAULT_TITLES)
-        self.sound_on = True             # تفعيل التنبيه الصوتي
-        self.source_mode = "auto"        # مصدر السعر: auto أو اسم مصدر محدد
-        self.last_update = ""            # آخر وقت تحديث ناجح (لعرضه عند الفتح)
+        self.sound_on = True
+        self.source_mode = "auto"
+        self.last_update = ""
+        self.dark_mode = True
+        self.theme = dict(DEFAULT_THEME)
+        self.lock_minutes = 10
+        self.locked = False
+        self._delta_oz = 0.0
+        self._ticks = 0
+        self._fails = 0
+        self._fx_last = 0.0
+        self.al_win = None
+        self.row_map = {}
+        self.price_widget = None   # الويدجيت العائم لسعر الغرام
+        self._widget_on = False     # هل كان الويدجيت مفتوحاً (يُستعاد بعد إعادة البناء)
+        self._widget_geo = ""       # موضع الويدجيت المحفوظ (+x+y)
+        self._page = "main"
+        self.user = None            # المستخدم الحالي بعد تسجيل الدخول
+        self.data_file = DATA_FILE  # ملف بيانات المستخدم الحالي
+        self.login_frame = None
+        self._live_on = False
+        # القفل التلقائي عند الخمول (0 = معطّل)
+        self.dark_mode = True       # المظهر الداكن افتراضياً (يُحفظ لكل حساب)
+        self.privacy = False        # وضع الخصوصية (إخفاء الأرقام) — للجلسة فقط
+        self._last_backup = 0.0
+        self.lock_minutes = 10
+        self.locked = False
+        self.lock_frame = None
+        self._last_activity = time.monotonic()
+        self._idle_job = None
+        self._act_bound = False
+        self._act_last = 0.0
         self.load()
 
         self.build_ui()
-        # عرض آخر سعر محفوظ فوراً عند الفتح (قبل وصول أول تحديث مباشر)
         if self.spot_oz_usd:
             self.render()
             when = "  •  آخر تحديث {}".format(self.last_update) if self.last_update else ""
-            self.lbl_upd.config(
-                text="○ آخر سعر محفوظ • الأونصة ${:.3f}{} • جارٍ التحديث…".format(
-                    self.spot_oz_usd, when))
-        self.start_live_refresh()
+            try:
+                self.lbl_upd.config(
+                    text="○ آخر سعر محفوظ • الأونصة ${:.3f}{} • جارٍ التحديث…".format(
+                        self.spot_oz_usd, when))
+            except Exception:
+                pass
+        self.show_login()
 
-    # ---------- التخزين ----------
+    # ============================ التخزين ============================
     def load(self):
+        path = getattr(self, "data_file", None) or DATA_FILE
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
             self.holdings = d.get("holdings", [])
             self.sells = d.get("sells", [])
-            # ترحيل بيانات قديمة: أي مركز يحمل سعر بيع → تحويله إلى عملية بيع
+            # ترحيل قديم: مركز يحمل سعر بيع → عملية بيع
             migrated = []
             for h in list(self.holdings):
                 if h.get("sell") is not None:
-                    factor = OZ_TO_G if h.get("unit") == "oz" else 1
-                    qty_g = h.get("qty", 0) * factor
                     self.sells.append({
                         "name": h.get("name", "بيع ذهب"),
-                        "qty_g": qty_g,
-                        "sell": h["sell"] / factor,
-                        "cost": h.get("qty", 0) * h.get("buy", 0),
+                        "qty": h.get("qty", 0),
+                        "unit": h.get("unit", "g"),
+                        "buy": h.get("buy", 0),
+                        "sell": h["sell"],
                         "date": h.get("sell_date", ""),
                     })
                 else:
@@ -293,124 +1253,1150 @@ class GoldApp:
             self.history = d.get("history", [])
             self.price_hist = d.get("price_hist", [])
             self.cur = d.get("cur", "USD")
+            try:
+                self.karat = int(d.get("karat", 24))
+            except (TypeError, ValueError):
+                self.karat = 24
+            cr = d.get("chart_range", "day")
+            self.chart_range = cr if cr in ("hour", "day", "week") else "day"
             self.adjust = float(d.get("adjust", 5.22))
             self.buy_margin = float(d.get("buy_margin", 0.0))
             self.alerts = d.get("alerts", [])
-            # طبّق السمة المحفوظة فقط إذا طابقت النسخة الحالية،
-            # وإلا أبقِ السمة الحديثة الافتراضية (مع الحفاظ على باقي البيانات).
+            self.dark_mode = bool(d.get("dark_mode", True))
+            self.theme = dict(self._base_theme())
             if d.get("theme_ver") == THEME_VER:
                 self.theme.update(d.get("theme", {}))
             self.titles.update(d.get("titles", {}))
             self.sound_on = bool(d.get("sound_on", True))
             self.source_mode = d.get("source_mode", "auto")
-            # استعادة آخر سعر معروف + آخر أسعار صرف لعرضها فور فتح البرنامج
             self.spot_oz_usd = float(d.get("spot_oz_usd", 0.0) or 0.0)
             self.rates.update(d.get("rates", {}))
             self.last_update = d.get("last_update", "")
+            self._widget_on = bool(d.get("widget_on", False))
+            self._widget_geo = str(d.get("widget_geo", "") or "")
+            try:
+                self.lock_minutes = max(0, int(d.get("lock_minutes", 10)))
+            except (TypeError, ValueError):
+                self.lock_minutes = 10
         except Exception:
             pass
+        if self.cur not in CUR:
+            self.cur = "USD"
+        if self.karat not in KARATS:
+            self.karat = 24
 
     def save(self):
+        if not getattr(self, "user", None):
+            return
         try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump({"holdings": self.holdings, "cur": self.cur,
-                           "sells": self.sells,
-                           "history": self.history,
-                           "price_hist": self.price_hist[-500:],
-                           "adjust": self.adjust, "buy_margin": self.buy_margin,
-                           "alerts": self.alerts,
-                           "theme": self.theme, "theme_ver": THEME_VER,
-                           "titles": self.titles,
-                           "sound_on": self.sound_on,
-                           "source_mode": self.source_mode,
-                           "spot_oz_usd": self.spot_oz_usd,
-                           "rates": self.rates,
-                           "last_update": getattr(self, "last_update", "")},
-                          f, ensure_ascii=False)
+            with open(self.data_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "holdings": self.holdings,
+                    "sells": self.sells,
+                    "history": self.history,
+                    "price_hist": self.price_hist[-500:],
+                    "cur": self.cur,
+                    "karat": self.karat,
+                    "chart_range": self.chart_range,
+                    "adjust": self.adjust,
+                    "buy_margin": self.buy_margin,
+                    "alerts": self.alerts,
+                    "theme": self.theme,
+                    "theme_ver": THEME_VER,
+                    "titles": self.titles,
+                    "sound_on": self.sound_on,
+                    "source_mode": self.source_mode,
+                    "spot_oz_usd": self.spot_oz_usd,
+                    "rates": self.rates,
+                    "last_update": self.last_update,
+                    "lock_minutes": self.lock_minutes,
+                    "dark_mode": self.dark_mode,
+                    "widget_on": bool(getattr(self, "_widget_on", False)),
+                    "widget_geo": getattr(self, "_widget_geo", ""),
+                }, f, ensure_ascii=False)
+            self.auto_backup()
         except Exception:
             pass
 
-    # ---------- حسابات ----------
+    # ============================ النسخ الاحتياطي ============================
+    def backup_dir(self):
+        d = os.path.join(HOME_DIR, "gold_portfolio_backups")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        return d
+
+    def _backup_glob(self):
+        return sorted(glob.glob(os.path.join(self.backup_dir(),
+                                             "gold_portfolio_data*.json")))
+
+    def auto_backup(self, force=False):
+        """نسخة احتياطية دورية (كل 10 دقائق كحد أقصى) مع الاحتفاظ بآخر 15 نسخة."""
+        if not getattr(self, "user", None):
+            return None
+        try:
+            if not os.path.exists(self.data_file):
+                return None
+            now = time.time()
+            if not force and now - getattr(self, "_last_backup", 0.0) < 600:
+                return None
+            self._last_backup = now
+            base = os.path.splitext(os.path.basename(self.data_file))[0]
+            target = os.path.join(self.backup_dir(), "{}_{}.json".format(
+                base, datetime.now().strftime("%Y%m%d_%H%M%S")))
+            shutil.copyfile(self.data_file, target)
+            files = self._backup_glob()
+            for old in files[:-15]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+            return target
+        except Exception:
+            return None
+
+    def latest_backup(self):
+        files = self._backup_glob()
+        return files[-1] if files else None
+
+    def restore_latest_backup(self):
+        src = self.latest_backup()
+        if not src:
+            messagebox.showinfo("استعادة نسخة",
+                                "لا توجد نسخ احتياطية بعد.\nاضغط «نسخ احتياطي الآن» أولاً.")
+            return
+        if not messagebox.askyesno(
+                "استعادة نسخة",
+                "سيتم استبدال بياناتك الحالية بالنسخة:\n{}\n\nهل أنت متأكد؟".format(
+                    os.path.basename(src)), parent=self.root):
+            return
+        try:
+            shutil.copyfile(src, self.data_file)
+        except Exception as e:
+            messagebox.showerror("استعادة نسخة", "تعذّرت الاستعادة:\n{}".format(e))
+            return
+        self._reset_state()
+        self.load()
+        self.rebuild_ui()
+        messagebox.showinfo("استعادة نسخة", "تمت استعادة النسخة بنجاح ✔")
+
+    # ============================ الحسابات وتسجيل الدخول ============================
+    def _reset_state(self):
+        """يعيد كل الحقول إلى الافتراضي قبل تحميل بيانات مستخدم آخر."""
+        self.holdings = []
+        self.sells = []
+        self.history = []
+        self.price_hist = []
+        self.alerts = []
+        self.theme = dict(DEFAULT_THEME)
+        self.titles = dict(DEFAULT_TITLES)
+        self.cur = "USD"
+        self.karat = 24
+        self.chart_range = "day"
+        self.adjust = 5.22
+        self.buy_margin = 0.0
+        self.sound_on = True
+        self.source_mode = "auto"
+        self.spot_oz_usd = 0.0
+        self.rates = dict(DEFAULT_RATES)
+        self.last_update = ""
+        self._delta_oz = 0.0
+        self._ticks = 0
+        self._fails = 0
+        self.al_win = None
+        self.row_map = {}
+        self._pages = {}
+        self._page = "main"
+
+    def show_login(self, mode="login", error=""):
+        """شاشة تسجيل الدخول / إنشاء حساب تغطي النافذة قبل استخدام البرنامج."""
+        users = load_users()
+        if not users:
+            mode = "register"
+        try:
+            self._close_chooser()
+        except Exception:
+            pass
+        self._lg_mode = mode
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+
+        old = getattr(self, "login_frame", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        self.root.configure(bg=BG)
+        ov = tk.Frame(self.root, bg=BG)
+        ov.place(x=0, y=0, relwidth=1, relheight=1)
+        self.login_frame = ov
+        box = tk.Frame(ov, bg=CARD, highlightthickness=1,
+                       highlightbackground=t.get("border", "#252c39"))
+        box.place(relx=0.5, rely=0.5, anchor="center", width=470)
+        inner = tk.Frame(box, bg=CARD)
+        inner.pack(fill="both", expand=True, padx=36, pady=28)
+
+        tk.Label(inner, text="◈", bg=CARD, fg=GOLD,
+                 font=("Segoe UI", 20)).pack()
+        tk.Label(inner, text="محفظة الذهب", bg=CARD, fg=TXT,
+                 font=("Segoe UI", 19, "bold")).pack(pady=(2, 2))
+        sub = ("سجّل الدخول لعرض بياناتك الخاصة" if mode == "login"
+               else "أنشئ حسابك لتبدأ بمحفظة مستقلة")
+        tk.Label(inner, text=sub, bg=CARD, fg=MUT,
+                 font=("Segoe UI", 10)).pack(pady=(0, 14))
+        tk.Frame(inner, bg=t.get("border", "#252c39"), height=1).pack(fill="x", pady=(0, 6))
+
+        def field(label, secret=False):
+            tk.Label(inner, text=label, bg=CARD, fg=MUT,
+                     font=("Segoe UI", 11), anchor="e").pack(fill="x", pady=(9, 3))
+            e = self._mkentry(inner, tk.StringVar(), width=22)
+            e.configure(justify="right")
+            if secret:
+                e.configure(show="•")
+            e.pack(fill="x", ipady=6)
+            return e
+
+        self.lg_user = field("اسم المستخدم")
+        self.lg_pw = field("كلمة المرور", secret=True)
+        self.lg_pw2 = field("تأكيد كلمة المرور", secret=True) if mode == "register" else None
+
+        last_user = load_prefs().get("last_user") or ""
+        self.lg_remember = None
+        if mode == "login":
+            self.lg_remember = tk.BooleanVar(value=bool(last_user))
+            tk.Checkbutton(inner, text="تذكّر اسم المستخدم",
+                           variable=self.lg_remember, bg=CARD, fg=MUT,
+                           selectcolor=t.get("entry_bg", "#151a23"),
+                           activebackground=CARD, activeforeground=TXT,
+                           bd=0, highlightthickness=0, cursor="hand2",
+                           font=("Segoe UI", 10)).pack(anchor="e", pady=(10, 0))
+            if last_user:
+                self.lg_user.insert(0, last_user)
+        self.lg_err = tk.Label(inner, text=error, bg=CARD, fg=t.get("loss", "#ff6b6b"),
+                               font=("Segoe UI", 11), wraplength=380, justify="right")
+        self.lg_err.pack(fill="x", pady=(10, 0))
+
+        self._mkbtn(inner, "دخول" if mode == "login" else "إنشاء الحساب",
+                    self._login_submit, kind="primary",
+                    font_size=11).pack(fill="x", pady=(12, 6), ipady=4)
+        alt = ("＋ إنشاء حساب جديد" if mode == "login"
+               else "لديك حساب؟ سجّل الدخول")
+        self._mkbtn(inner, alt,
+                    lambda: self.show_login("register" if mode == "login" else "login"),
+                    kind="ghost", font_size=10).pack(fill="x")
+
+        if mode == "register" and os.path.exists(DATA_FILE) and not users:
+            tk.Label(inner, text="لديك بيانات محفوظة على هذا الجهاز — ستُربط بحسابك تلقائياً.",
+                     bg=CARD, fg=MUT, font=("Segoe UI", 11), wraplength=380,
+                     justify="right").pack(fill="x", pady=(12, 0))
+
+        for e in (self.lg_user, self.lg_pw, self.lg_pw2):
+            if e is not None:
+                e.bind("<Return>", lambda _e: self._login_submit())
+        try:
+            (self.lg_user if mode == "register" else self.lg_pw).focus_set()
+        except Exception:
+            pass
+
+    def _login_error(self, msg):
+        try:
+            self.lg_err.config(text=msg)
+        except Exception:
+            pass
+
+    def _remember_user(self, name):
+        """يحفظ اسم المستخدم فقط إذا فعّل الخيار (كلمة المرور لا تُحفظ إطلاقاً)."""
+        prefs = load_prefs()
+        box = getattr(self, "lg_remember", None)
+        remember = bool(box.get()) if box is not None else True
+        if remember:
+            prefs["last_user"] = name
+        else:
+            prefs.pop("last_user", None)
+        save_prefs(prefs)
+
+    def _login_submit(self):
+        if getattr(self, "_lg_mode", "login") == "register":
+            self._do_register()
+        else:
+            self._do_login()
+
+    def _do_login(self):
+        name = (self.lg_user.get() or "").strip()
+        pw = self.lg_pw.get() or ""
+        if not name or not pw:
+            self._login_error("أدخل اسم المستخدم وكلمة المرور.")
+            return
+        users = load_users()
+        rec = users.get(name)
+        if rec is None:
+            for k in users:
+                if k.lower() == name.lower():
+                    name, rec = k, users[k]
+                    break
+        if rec is None or not verify_password(pw, rec.get("salt", ""), rec.get("hash", "")):
+            self._login_error("اسم المستخدم أو كلمة المرور غير صحيحة.")
+            return
+        self._remember_user(name)
+        self._finish_login(name)
+
+    def _do_register(self):
+        name = (self.lg_user.get() or "").strip()
+        pw = self.lg_pw.get() or ""
+        pw2 = (self.lg_pw2.get() or "") if self.lg_pw2 is not None else ""
+        if len(name) < 3:
+            self._login_error("اسم المستخدم يجب أن يكون 3 أحرف على الأقل.")
+            return
+        if not all(c.isalnum() or c in " ._-" for c in name):
+            self._login_error("استخدم حروفاً وأرقاماً فقط (يُسمح بـ . _ - والمسافة).")
+            return
+        if len(pw) < 4:
+            self._login_error("كلمة المرور يجب أن تكون 4 أحرف على الأقل.")
+            return
+        if pw != pw2:
+            self._login_error("كلمتا المرور غير متطابقتين.")
+            return
+        users = load_users()
+        if any(k.lower() == name.lower() for k in users):
+            self._login_error("اسم المستخدم مستخدم بالفعل، اختر اسماً آخر.")
+            return
+        salt, h = hash_password(pw)
+        users[name] = {"salt": salt, "hash": h,
+                       "created": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        if not save_users(users):
+            self._login_error("تعذّر حفظ الحساب، تحقق من صلاحيات الكتابة.")
+            return
+        prefs = load_prefs()
+        prefs["last_user"] = name
+        save_prefs(prefs)
+        self._finish_login(name)
+
+    def _finish_login(self, name):
+        """يفتح جلسة المستخدم: يحمّل ملفه الخاص ويعيد بناء الواجهة."""
+        self.user = name
+        self.data_file = user_data_file(name)
+        users = load_users()
+        # أول حساب على جهاز فيه بيانات قديمة: يتبنّاها بدل أن تضيع
+        if (not os.path.exists(self.data_file) and os.path.exists(DATA_FILE)
+                and len(users) <= 1):
+            try:
+                shutil.copyfile(DATA_FILE, self.data_file)
+            except Exception:
+                pass
+        self._reset_state()
+        self.load()
+        self.save()
+        lf = getattr(self, "login_frame", None)
+        if lf is not None:
+            try:
+                lf.destroy()
+            except Exception:
+                pass
+        self.login_frame = None
+        self._closing_page = True
+        try:
+            for w in list(self.root.winfo_children()):
+                w.destroy()
+        finally:
+            self._closing_page = False
+        self._live_on = False
+        self.build_ui()
+        self.locked = False
+        self.lock_frame = None
+        self._last_activity = time.monotonic()
+        self._bind_activity()
+        self._schedule_idle_check()
+        self.render()
+        self.start_live_refresh()
+        if getattr(self, "_widget_on", False):
+            self.open_widget()
+
+    def logout(self):
+        if not messagebox.askyesno("تسجيل الخروج",
+                                   "هل تريد تسجيل الخروج من هذا الحساب؟",
+                                   parent=self.root):
+            return
+        self.save()
+        self._live_on = False
+        self.locked = False
+        self.close_widget()
+        self.lock_frame = None
+        self._closing_page = True
+        try:
+            for w in list(self.root.winfo_children()):
+                w.destroy()
+        finally:
+            self._closing_page = False
+        self._pages = {}
+        self.user = None
+        self.data_file = DATA_FILE
+        self.login_frame = None
+        self._reset_state()
+        self.show_login("login")
+
+    # ============================ القفل التلقائي عند الخمول ============================
+    def _bind_activity(self):
+        """يرصد أي تفاعل (كتابة/نقر/حركة مؤشر) لإعادة تصفير مؤقّت الخمول."""
+        if getattr(self, "_act_bound", False):
+            return
+        self._act_bound = True
+        for seq in ("<Any-KeyPress>", "<Any-ButtonPress>",
+                    "<Motion>", "<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.root.bind_all(seq, self._on_activity, add="+")
+            except Exception:
+                pass
+        try:
+            self.root.bind_all("<Control-l>", lambda e: self.lock_now(), add="+")
+            self.root.bind_all("<Control-L>", lambda e: self.lock_now(), add="+")
+            self.root.bind_all("<Control-h>", lambda e: self.toggle_privacy(), add="+")
+            self.root.bind_all("<Control-H>", lambda e: self.toggle_privacy(), add="+")
+            self.root.bind_all("<Control-n>", lambda e: self._shortcut_buy(), add="+")
+            self.root.bind_all("<Control-s>", lambda e: self.open_sell(), add="+")
+            self.root.bind_all("<Escape>", lambda e: self._shortcut_home(), add="+")
+            self.root.bind_all("<F9>", lambda e: self.toggle_widget(), add="+")
+        except Exception:
+            pass
+
+    def _on_activity(self, event=None):
+        # منع التحديث المتكرر أثناء حركة المؤشر (throttle بسيط)
+        now = time.monotonic()
+        if now - getattr(self, "_act_last", 0.0) < 0.3:
+            return
+        self._act_last = now
+        self._last_activity = now
+
+    def _schedule_idle_check(self):
+        if getattr(self, "_idle_job", None) is not None:
+            return
+        try:
+            self._idle_job = self.root.after(5000, self._idle_tick)
+        except Exception:
+            self._idle_job = None
+
+    def _idle_tick(self):
+        self._idle_job = None
+        try:
+            if getattr(self, "user", None) and not getattr(self, "locked", False):
+                mins = int(getattr(self, "lock_minutes", 0) or 0)
+                if mins > 0 and (time.monotonic() - self._last_activity) >= mins * 60:
+                    self.lock_now()
+        except Exception:
+            pass
+        self._schedule_idle_check()
+
+    def lock_now(self):
+        """يقفل التطبيق بطبقة تغطي كل شيء وتطلب كلمة المرور للعودة."""
+        if not getattr(self, "user", None) or getattr(self, "locked", False):
+            return
+        self.locked = True
+        self._widget_restore = getattr(self, "price_widget", None) is not None
+        self.close_widget()
+        self.save()
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+        px = self._px
+        old = getattr(self, "lock_frame", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        ov = tk.Frame(self.root, bg=BG)
+        ov.place(x=0, y=0, relwidth=1, relheight=1)
+        ov.lift()
+        self.lock_frame = ov
+
+        card = tk.Frame(ov, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        card.place(relx=0.5, rely=0.5, anchor="center", width=px(430))
+        inner = tk.Frame(card, bg=CARD)
+        inner.pack(fill="both", expand=True, padx=px(32), pady=px(26))
+
+        tk.Label(inner, text="🔒", bg=CARD, fg=GOLD,
+                 font=("Segoe UI", 26)).pack()
+        tk.Label(inner, text="التطبيق مقفل", bg=CARD, fg=TXT,
+                 font=("Segoe UI", 17, "bold")).pack(pady=(4, 2))
+        tk.Label(inner, text="قُفل تلقائياً بعد {} دقيقة من الخمول".format(self.lock_minutes)
+                 if self.lock_minutes else "أدخل كلمة المرور للمتابعة",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(pady=(0, 4))
+        tk.Label(inner, text="الحساب: {}".format(self.user or ""), bg=CARD,
+                 fg=GOLD, font=("Segoe UI", 11, "bold")).pack(pady=(0, 10))
+        tk.Frame(inner, bg=t.get("border", "#252c39"), height=1).pack(fill="x", pady=(0, 8))
+
+        v_pw = tk.StringVar()
+        ent = self._mkentry(inner, v_pw, width=24)
+        ent.configure(justify="right", show="•")
+        ent.pack(fill="x", ipady=7, pady=(6, 6))
+        err = tk.Label(inner, text="", bg=CARD, fg=t.get("loss", "#ff6b6b"),
+                       font=("Segoe UI", 10))
+        err.pack(fill="x")
+
+        def do_unlock(event=None):
+            users = load_users()
+            rec = users.get(self.user) or {}
+            if verify_password(v_pw.get(), rec.get("salt", ""), rec.get("hash", "")):
+                self._close_lock()
+            else:
+                err.config(text="كلمة المرور غير صحيحة، حاول مرة أخرى.")
+                v_pw.set("")
+                try:
+                    ent.focus_set()
+                except Exception:
+                    pass
+
+        bar = tk.Frame(inner, bg=CARD)
+        bar.pack(fill="x", pady=(10, 4))
+        self._mkbtn(bar, "🔓  فتح", do_unlock, kind="primary",
+                    font_size=11).pack(side="right", fill="x", expand=True, ipady=3)
+        self._mkbtn(bar, "تسجيل الخروج", self._lock_logout, kind="ghost",
+                    font_size=10).pack(side="right", padx=(0, 8))
+        ent.bind("<Return>", do_unlock)
+        try:
+            ent.focus_set()
+        except Exception:
+            pass
+        tk.Label(inner, text="Ctrl+L للقفل اليدوي في أي وقت", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 10)).pack(pady=(8, 0))
+
+    def _close_lock(self):
+        f = getattr(self, "lock_frame", None)
+        self.lock_frame = None
+        self.locked = False
+        self._last_activity = time.monotonic()
+        if getattr(self, "_widget_restore", False):
+            self._widget_restore = False
+            self.open_widget()
+        if f is not None:
+            try:
+                f.destroy()
+            except Exception:
+                pass
+
+    def _lock_logout(self):
+        self._close_lock()
+        self.logout()
+
+    def open_account(self):
+        """صفحة الحساب: تغيير كلمة المرور وتسجيل الخروج."""
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+        win = self._open_page("account", "الحساب")
+        win.configure(bg=BG)
+        win.geometry("520x460")
+        win.transient(self.root)
+
+        card = tk.Frame(win, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        card.pack(fill="both", expand=True, padx=4, pady=8)
+
+        head = tk.Frame(card, bg=CARD)
+        head.pack(fill="x", padx=24, pady=(18, 12))
+        tk.Label(head, text="👤", bg=CARD, fg=GOLD,
+                 font=("Segoe UI", 20)).pack(side="right")
+        info = tk.Frame(head, bg=CARD)
+        info.pack(side="right", padx=12)
+        tk.Label(info, text=self.user or "", bg=CARD, fg=TXT,
+                 font=("Segoe UI", 14, "bold")).pack(anchor="e")
+        tk.Label(info, text="بياناتك محفوظة في ملف خاص بهذا الحساب فقط",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(anchor="e")
+
+        tk.Frame(card, bg=t.get("border", "#252c39"), height=1).pack(fill="x", padx=24)
+        tk.Label(card, text="تغيير كلمة المرور", bg=CARD, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="e", padx=24, pady=(16, 6))
+
+        v_old, v_new, v_conf = tk.StringVar(), tk.StringVar(), tk.StringVar()
+
+        def prow(label, var, secret=True):
+            fr = tk.Frame(card, bg=CARD)
+            fr.pack(fill="x", padx=24, pady=5)
+            tk.Label(fr, text=label, bg=CARD, fg=MUT, width=18, anchor="e",
+                     font=("Segoe UI", 10)).pack(side="right")
+            e = self._mkentry(fr, var, width=18)
+            e.configure(justify="right")
+            if secret:
+                e.configure(show="•")
+            e.pack(side="right", fill="x", expand=True, padx=8, ipady=4)
+
+        prow("كلمة المرور الحالية", v_old)
+        prow("كلمة المرور الجديدة", v_new)
+        prow("تأكيد الجديدة", v_conf)
+
+        def do_change():
+            users = load_users()
+            rec = users.get(self.user) or {}
+            if not verify_password(v_old.get(), rec.get("salt", ""), rec.get("hash", "")):
+                messagebox.showerror("تغيير كلمة المرور",
+                                     "كلمة المرور الحالية غير صحيحة.", parent=win)
+                return
+            if len(v_new.get() or "") < 4:
+                messagebox.showwarning("تغيير كلمة المرور",
+                                       "كلمة المرور الجديدة قصيرة (4 أحرف على الأقل).",
+                                       parent=win)
+                return
+            if v_new.get() != v_conf.get():
+                messagebox.showwarning("تغيير كلمة المرور",
+                                       "كلمتا المرور غير متطابقتين.", parent=win)
+                return
+            salt, h = hash_password(v_new.get())
+            rec.update({"salt": salt, "hash": h})
+            users[self.user] = rec
+            if not save_users(users):
+                messagebox.showerror("تغيير كلمة المرور", "تعذّر حفظ التغيير.", parent=win)
+                return
+            for v in (v_old, v_new, v_conf):
+                v.set("")
+            messagebox.showinfo("تم", "تم تغيير كلمة المرور بنجاح.", parent=win)
+
+        bar = tk.Frame(card, bg=CARD)
+        bar.pack(fill="x", padx=24, pady=(14, 10))
+        self._mkbtn(bar, "✔  حفظ كلمة المرور", do_change, kind="primary",
+                    font_size=10).pack(side="right")
+
+        # ---- القفل التلقائي عند الخمول ----
+        tk.Frame(card, bg=t.get("border", "#252c39"), height=1).pack(
+            fill="x", padx=24, pady=(10, 0))
+        tk.Label(card, text="🔒  القفل التلقائي عند الخمول", bg=CARD, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="e", padx=24, pady=(14, 2))
+        tk.Label(card, text="عند ترك التطبيق دون استخدام يُقفل نفسه ويطلب كلمة المرور للعودة.",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 11), justify="right",
+                 wraplength=520).pack(anchor="e", padx=24)
+
+        v_on = tk.BooleanVar(value=int(getattr(self, "lock_minutes", 0) or 0) > 0)
+        cur_mins = int(getattr(self, "lock_minutes", 0) or 0) or 10
+        v_mins = tk.StringVar(value=str(cur_mins))
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=24, pady=(10, 2))
+        tk.Label(row, text="دقيقة من دون استخدام", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 10)).pack(side="right", padx=(6, 8))
+        om = tk.OptionMenu(row, v_mins, *["1", "2", "5", "10", "15", "30", "60"])
+        om.configure(bg=t.get("entry_bg", "#151a23"), fg=TXT, bd=0,
+                     highlightthickness=0, activebackground=CARD,
+                     activeforeground=GOLD, font=("Segoe UI", 11),
+                     relief="flat", cursor="hand2", width=4, anchor="center")
+        om["menu"].configure(bg=t.get("card2", "#1a2029"), fg=TXT,
+                             activebackground=t["accent"], activeforeground=t["accent_text"],
+                             font=("Segoe UI", 11), bd=0)
+        om.pack(side="right")
+        tk.Checkbutton(row, text="مفعّل", variable=v_on, bg=CARD, fg=TXT,
+                       selectcolor=t.get("entry_bg", "#151a23"),
+                       activebackground=CARD, activeforeground=GOLD,
+                       bd=0, highlightthickness=0, cursor="hand2",
+                       font=("Segoe UI", 10)).pack(side="right", padx=(0, 10))
+
+        st_lock = tk.Label(card, text="", bg=CARD, fg=t.get("profit", "#3ddc97"),
+                           font=("Segoe UI", 10))
+        st_lock.pack(anchor="e", padx=24, pady=(4, 0))
+
+        def save_lock():
+            try:
+                mins = max(1, int(v_mins.get()))
+            except (TypeError, ValueError):
+                mins = 10
+            self.lock_minutes = mins if v_on.get() else 0
+            self.save()
+            self._last_activity = time.monotonic()
+            st_lock.config(text=("سيعمل القفل بعد {} دقيقة من الخمول ✔".format(mins)
+                                 if self.lock_minutes else "القفل التلقائي معطّل"))
+
+        self._mkbtn(card, "✔  حفظ إعداد القفل", save_lock, kind="primary",
+                    font_size=10).pack(anchor="e", padx=24, pady=(8, 0))
+        tk.Frame(card, bg=t.get("border", "#252c39"), height=1).pack(fill="x", padx=24, pady=(8, 0))
+        foot = tk.Frame(card, bg=CARD)
+        foot.pack(fill="x", padx=24, pady=(12, 16))
+        self._mkbtn(foot, "تسجيل الخروج", self.logout, kind="danger",
+                    font_size=10).pack(side="right")
+        tk.Label(foot, text="عند الخروج تُغلق جلستك وتبقى بياناتك محفوظة.",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(side="right", padx=10)
+
+    # ============================ حسابات ============================
     def rate(self):
         return self.rates.get(self.cur, 1.0)
 
     def money(self, usd_amount):
-        v = usd_amount * self.rate()
-        return "{}{:,.2f}".format(CUR[self.cur]["sym"], v)
+        return "{}{:,.2f}".format(CUR[self.cur]["sym"], usd_amount * self.rate())
 
     def gram_market_disp(self):
-        """سعر الغرام السوقي بالعملة المعروضة (بدون طرح)."""
+        """سعر الغرام السوقي (بدون طرح) بالعملة المعروضة."""
         return (self.spot_oz_usd / OZ_TO_G) * self.rate()
 
     def gram_eff_disp(self):
-        """سعر الراجحي للبيع (العالمي ناقص فرق البيع) للغرام."""
+        """سعر الراجحي للبيع (السوقي ناقص فرق البيع) للغرام."""
+        if self.cur != "SAR":
+            # فرق الراجحي بالريال السعودي فقط — لغير الريال نعرض السوقي
+            return self.gram_market_disp()
         return self.gram_market_disp() - self.adjust
 
     def gram_buy_disp(self):
-        """سعر الراجحي للشراء (العالمي زائد فرق الشراء) للغرام."""
+        """سعر الراجحي للشراء (السوقي زائد فرق الشراء) للغرام."""
+        if self.cur != "SAR":
+            return self.gram_market_disp()
         return self.gram_market_disp() + self.buy_margin
 
-    def current_per_unit_disp(self, unit):
-        g = self.gram_eff_disp()
+    def portfolio_value_disp(self):
+        """القيمة الحالية للمحفظة بعملة العرض (وزن كل عملية × سعر عيارها)."""
+        total = 0.0
+        for h in (getattr(self, "holdings", None) or []):
+            try:
+                total += float(h["qty"]) * self.current_per_unit_disp(
+                    h.get("unit", "g"), h.get("karat", 24))
+            except Exception:
+                continue
+        return total
+
+    def current_per_unit_disp(self, unit, karat=24):
+        """السعر الحالي للوحدة بعيار محدد (الراجحي للبيع إن كانت العملة سعودية، وإلا السوقي)."""
+        g = self.gram_eff_disp() * karat_factor(karat)
         return g * OZ_TO_G if unit == "oz" else g
 
-    # ---------- الواجهة ----------
-    # ---------- عناصر واجهة حديثة (مساعدات) ----------
-    def _mkbtn(self, parent, text, cmd, kind="primary", font_size=10, **kw):
-        """زر مسطّح حديث مع تأثير تمرير (hover)."""
-        t = self.theme
-        palette = {
-            "primary": (t["accent"], t["accent_text"], t.get("hover", "#f0c954")),
-            "ghost":   (t["card2"], t["accent"], t.get("border", "#2a3240")),
-            "danger":  (t["loss"], "#ffffff", "#ff7a7a"),
-            "neutral": (t["card2"], t["text"], t.get("border", "#2e3744")),
-            "success": (t.get("profit", "#2ecc71"), "#ffffff", "#3fe088"),
+    def widget_prices(self):
+        """سعر الغرام (بيع/شراء) بالريال السعودي والدينار الأردني حسب الراجحي.
+        فرق الراجحي بالريال السعودي يُحوّل للدينار بنفس سعر الصرف."""
+        oz = float(getattr(self, "spot_oz_usd", 0.0) or 0.0)
+        if oz <= 0:
+            return None
+        kf = karat_factor(getattr(self, "karat", 24))
+        sar = float(self.rates.get("SAR", 3.75) or 3.75)
+        jod = float(self.rates.get("JOD", 0.709) or 0.709)
+        g_usd = oz / OZ_TO_G
+        sar_mkt = g_usd * sar
+        jod_mkt = g_usd * jod
+        sar_per_jod = (sar / jod) if jod else 1.0
+        adjust = float(getattr(self, "adjust", 0.0) or 0.0)
+        margin = float(getattr(self, "buy_margin", 0.0) or 0.0)
+        adj_jod = adjust / sar_per_jod if sar_per_jod else 0.0
+        mar_jod = margin / sar_per_jod if sar_per_jod else 0.0
+        return {
+            "sar": {"mkt": sar_mkt * kf, "sell": (sar_mkt - adjust) * kf,
+                    "buy": (sar_mkt + margin) * kf},
+            "jod": {"mkt": jod_mkt * kf, "sell": (jod_mkt - adj_jod) * kf,
+                    "buy": (jod_mkt + mar_jod) * kf},
+            "oz_usd": oz, "adjust_sar": adjust,
         }
-        bg, fg, hover = palette.get(kind, palette["primary"])
-        b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                      activebackground=hover, activeforeground=fg,
-                      relief="flat", bd=0, cursor="hand2",
-                      font=("Segoe UI", font_size, "bold"),
-                      padx=14, pady=7, **kw)
-        b.bind("<Enter>", lambda e: b.config(bg=hover))
-        b.bind("<Leave>", lambda e: b.config(bg=bg))
-        return b
 
-    def _mkentry(self, parent, textvariable=None, width=16):
-        """حقل إدخال مسطّح بحدود خفيفة."""
+    def total_open_grams(self):
+        return sum(h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
+                   for h in self.holdings)
+
+    def avg_buy_per_gram_usd(self):
+        g = self.total_open_grams()
+        if not g:
+            return 0.0
+        return sum(h["qty"] * h["buy"] for h in self.holdings) / g
+
+    # ============================ مساعدات واجهة ============================
+    def _mkbtn(self, parent, text, cmd, kind="primary", font_size=11, **kw):
         t = self.theme
-        return tk.Entry(parent, textvariable=textvariable, width=width,
-                        bg=t.get("entry_bg", "#1b2029"), fg=t["text"],
-                        insertbackground=t["accent"], relief="flat", bd=0,
+        palettes = {
+            "primary": (t["accent"], t["accent_text"], t.get("hover", "#f3d8a5")),
+            "success": (t.get("profit", "#3ddc97"), "#07130d", "#6ae8b4"),
+            "danger": (t.get("loss", "#ff6b6b"), "#1a0a0a", "#ff9292"),
+            "neutral": (t["card2"], t["text"], t.get("border", "#252c39")),
+            "ghost": (t["bg"], t["accent"], t.get("card2", "#1a2029")),
+        }
+        bg, fg, hv = palettes.get(kind, palettes["primary"])
+        btn = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
+                        activebackground=hv, activeforeground=fg, relief="flat",
+                        bd=0, padx=16, pady=7, cursor="hand2",
                         highlightthickness=1,
-                        highlightbackground=t.get("border", "#2a3240"),
-                        highlightcolor=t["accent"],
+                        highlightbackground=t.get("border", "#252c39"),
+                        highlightcolor=hv,
+                        font=("Segoe UI", font_size, "bold"), **kw)
+
+        def _on_enter(_e=None):
+            try:
+                btn.configure(bg=hv)
+            except Exception:
+                pass
+
+        def _on_leave(_e=None):
+            try:
+                btn.configure(bg=bg)
+            except Exception:
+                pass
+
+        btn.bind("<Enter>", _on_enter)
+        btn.bind("<Leave>", _on_leave)
+        return btn
+
+    def _mkentry(self, parent, var, width=10):
+        t = self.theme
+        return tk.Entry(parent, textvariable=var, width=width, justify="center",
+                        bg=t.get("entry_bg", "#151a23"), fg=t["text"],
+                        insertbackground=t["text"], relief="flat", bd=0,
+                        highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"),
+                        highlightcolor=t.get("accent", "#e9c684"),
                         font=("Segoe UI", 10))
 
-    def _price_card(self, parent, title, value_attr, color, col):
-        """بطاقة سعر حديثة (عنوان خافت + قيمة بارزة)."""
+    def _price_card(self, parent, title, attr, color, col):
         t = self.theme
         card = tk.Frame(parent, bg=t["card"], highlightthickness=1,
-                        highlightbackground=t.get("border", "#2a3240"))
-        card.grid(row=0, column=col, sticky="nsew", padx=5)
-        parent.grid_columnconfigure(col, weight=1, uniform="price")
-        tk.Label(card, text=title, bg=t["card"], fg=t["muted"],
-                 font=("Segoe UI", 9), anchor="e").pack(fill="x", padx=12, pady=(10, 0))
+                        highlightbackground=t.get("border", "#252c39"))
+        card.grid(row=0, column=col, padx=7, pady=(0, 4), sticky="nsew")
+        tk.Frame(card, bg=color, height=3).pack(fill="x")
+        title_lbl = tk.Label(card, text=title, bg=t["card"], fg=t["muted"],
+                             font=("Segoe UI", 10))
+        title_lbl.pack(pady=(11, 2))
         lbl = tk.Label(card, text="--", bg=t["card"], fg=color,
-                       font=("Segoe UI", 15, "bold"), anchor="e")
-        lbl.pack(fill="x", padx=12, pady=(2, 12))
-        setattr(self, value_attr, lbl)
-        return lbl
+                       font=("Segoe UI", 18, "bold"))
+        lbl.pack(pady=(0, 13))
+        setattr(self, attr, lbl)
+        setattr(self, attr + "_title", title_lbl)
+        self._card_base_titles = getattr(self, "_card_base_titles", {})
+        self._card_base_titles[attr] = title
+        parent.grid_columnconfigure(col, weight=1)
+        return card
+
+    # ============================ بناء الواجهة ============================
+    def _base_theme(self):
+        """لوحة الألوان الأساسية حسب المظهر المختار."""
+        return LIGHT_THEME if not getattr(self, "dark_mode", True) else DEFAULT_THEME
+
+    def _hide(self, txt):
+        """وضع الخصوصية: يستبدل الأرقام برموز عند تفعيله."""
+        out = "" if txt is None else str(txt)
+        if not getattr(self, "privacy", False):
+            return out
+        return re.sub(r"\d[\d,\.]*", "•••", out)
+
+    # ==================== ويدجيت سعر الغرام ====================
+    def _refresh_widget(self):
+        w = getattr(self, "price_widget", None)
+        if w is None:
+            return
+        try:
+            w.refresh()
+        except Exception:
+            pass
+
+    def toggle_widget(self):
+        """إظهار/إخفاء ويدجيت سعر الغرام (F9)."""
+        if getattr(self, "price_widget", None) is not None:
+            self.close_widget()
+        else:
+            self.open_widget()
+
+    def open_widget(self):
+        if not getattr(self, "user", None):
+            return
+        if getattr(self, "price_widget", None) is not None:
+            try:
+                self.price_widget.win.lift()
+            except Exception:
+                pass
+            return
+        try:
+            self.price_widget = PriceWidget(self)
+        except Exception as e:
+            self.price_widget = None
+            messagebox.showerror("ويدجيت السعر",
+                                 "تعذّر فتح الويدجيت: {}".format(e))
+            return
+        self._widget_on = True
+        self._paint_widget_btn()
+        self.save()
+        self._refresh_widget()
+
+    def close_widget(self):
+        w = getattr(self, "price_widget", None)
+        self.price_widget = None
+        self._widget_on = False
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._paint_widget_btn()
+        self.save()
+
+    def _paint_widget_btn(self):
+        btn = getattr(self, "btn_widget", None)
+        if btn is None:
+            return
+        try:
+            btn.config(text="🪟 إخفاء"
+                       if getattr(self, "price_widget", None) is not None
+                       else "🪟 ويدجيت")
+        except Exception:
+            pass
+
+    def widget_karat_step(self, step):
+        """تبديل عيار الويدجيت (يُزامن عيار التطبيق كله)."""
+        ks = list(KARATS)
+        try:
+            i = ks.index(int(getattr(self, "karat", 24)))
+        except (TypeError, ValueError):
+            i = 0
+        k = ks[(i + step) % len(ks)]
+        try:
+            self.karat_var.set("{} قيراط".format(k))
+        except Exception:
+            self.karat = k
+        self._refresh_widget()
+
+    def toggle_theme(self):
+        """تبديل المظهر بين الداكن والفاتح (يُحفظ لكل حساب)."""
+        self.dark_mode = not getattr(self, "dark_mode", True)
+        self.theme = dict(self._base_theme())
+        self.save()
+        self.rebuild_ui()
+
+    def toggle_privacy(self):
+        """إخفاء/إظهار كل الأرقام بضغطة واحدة (Ctrl+H)."""
+        self.privacy = not getattr(self, "privacy", False)
+        btn = getattr(self, "btn_privacy", None)
+        if btn is not None:
+            try:
+                btn.configure(text="👁" if self.privacy else "🙈")
+            except Exception:
+                pass
+        try:
+            self.render()
+            self.update_price_labels()
+        except Exception:
+            pass
+
+    def _dash_card(self, parent, title, attr, color, col):
+        t = self.theme
+        card = tk.Frame(parent, bg=t.get("card2", t["card"]),
+                        highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        card.grid(row=0, column=col, padx=6, sticky="nsew")
+        tk.Label(card, text=title, bg=t.get("card2", t["card"]), fg=t["muted"],
+                 font=("Segoe UI", 10)).pack(pady=(5, 0))
+        lbl = tk.Label(card, text="--", bg=t.get("card2", t["card"]), fg=color,
+                       font=("Segoe UI", 13, "bold"))
+        lbl.pack(pady=(1, 6))
+        setattr(self, attr, lbl)
+        parent.grid_columnconfigure(col, weight=1)
+        return card
+
+    def _update_dashboard(self, qty_g, cost, val, pl):
+        if not hasattr(self, "dash_qty"):
+            return
+        t = self.theme
+        sym = CUR[self.cur]["sym"]
+        self.dash_qty.config(text=self._hide("{:,.2f} غ".format(qty_g)))
+        self.dash_cost.config(text=self._hide("{}{:,.2f}".format(sym, cost)))
+        self.dash_val.config(text=self._hide("{}{:,.2f}".format(sym, val)))
+        color = t["profit"] if pl > 0 else (t["loss"] if pl < 0 else t["total"])
+        self.dash_pl.config(text=self._hide("{}{}{:,.2f}".format(
+            "+" if pl > 0 else "", sym, pl)), fg=color)
+
+    def _px(self, n):
+        """يحوّل مقاساً منطقياً إلى بكسل حسب مقياس الشاشة الحالي."""
+        return max(2, int(round(n * getattr(self, "ui_scale", 1.0))))
+
+    def _screen_size(self):
+        try:
+            return (self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        except Exception:
+            return (1366, 768)
+
+    # ------------------------- الأيقونة والتمرير -------------------------
+    def _apply_icon(self):
+        """أيقونة النافذة وشريط المهام (مكتوبة من داخل البرنامج نفسه)."""
+        p = app_icon_path()
+        if not p:
+            return
+        try:
+            self.root.iconbitmap(default=p)
+            return
+        except Exception:
+            pass
+        try:
+            self.root.iconbitmap(p)
+        except Exception:
+            pass
+
+    def _bind_wheel(self):
+        """تمرير موحّد بعجلة الفأرة: يمرّر العنصر تحت المؤشر أو الصفحة."""
+        if getattr(self, "_wheel_bound", False):
+            return
+        self._wheel_bound = True
+        try:
+            self.root.bind_all("<MouseWheel>", self._on_wheel, add="+")
+            self.root.bind_all("<Button-4>",
+                               lambda e: self._on_wheel(e, -1), add="+")
+            self.root.bind_all("<Button-5>",
+                               lambda e: self._on_wheel(e, 1), add="+")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _widget_can_scroll(w, notches, horizontal, cls):
+        """يمرّر جدولاً/قائمة إن كانت قابلة للتمرير في هذا الاتجاه."""
+        try:
+            if horizontal and cls == "Treeview":
+                w.xview_scroll(int(notches), "units")
+                return True
+        except Exception:
+            pass
+        try:
+            first, last = w.yview()
+            first, last = float(first), float(last)
+        except Exception:
+            return False
+        if (last - first) >= 0.999:
+            return False
+        if notches < 0 and first <= 0.001:
+            return False
+        if notches > 0 and last >= 0.999:
+            return False
+        try:
+            w.yview_scroll(int(notches), "units")
+            return True
+        except Exception:
+            return False
+
+    def _on_wheel(self, event, direction=None):
+        """يمرّر أعمق عنصر قابل للتمرير تحت المؤشر، وإلا يمرّر صفحته."""
+        try:
+            node = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            node = None
+        if direction is None:
+            delta = getattr(event, "delta", 0) or 0
+            if delta == 0:
+                return None
+            notches = -int(round(float(delta) / 120.0))
+            if notches == 0:
+                notches = -1 if delta > 0 else 1
+        else:
+            notches = 3 * int(direction)
+        try:
+            shift = bool(int(getattr(event, "state", 0)) & 0x0001)
+        except Exception:
+            shift = False
+
+        target = None
+        while node is not None:
+            try:
+                cls = node.winfo_class()
+            except Exception:
+                cls = ""
+            if cls in ("TCombobox", "Spinbox"):
+                return "break"          # لا نغيّر قيمتها بالعجلة سهواً
+            if cls in ("Treeview", "Listbox", "Text"):
+                if self._widget_can_scroll(node, notches, shift, cls):
+                    return "break"
+            if isinstance(node, ScrollArea):
+                target = node
+                break
+            node = getattr(node, "master", None)
+        if target is not None:
+            try:
+                target.scroll_units(notches * 3, horizontal=shift)
+                return "break"
+            except Exception:
+                return None
+        return None
+
+    # ------------------------- إشعارات سطح المكتب -------------------------
+    def notify(self, title, message):
+        """إشعار سطح مكتب حقيقي + بطاقة داخل التطبيق."""
+        return desktop_notify(title, message, app=self)
+
+    def toast(self, title, message, system_ok=False):
+        """بطاقة إشعار صغيرة أسفل الشاشة تختفي وحدها بعد ثوانٍ."""
+        t = self.theme
+        old = getattr(self, "_toast", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        try:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+            bg = t.get("card2", t["card"])
+            box = tk.Frame(win, bg=bg, highlightthickness=2,
+                           highlightbackground=t.get("accent", "#e9c684"))
+            box.pack(fill="both", expand=True)
+            tk.Label(box, text="🔔  " + str(title), bg=bg,
+                     fg=t.get("accent", "#e9c684"),
+                     font=("Segoe UI", 12, "bold"), anchor="e").pack(
+                fill="x", padx=16, pady=(12, 2))
+            tk.Label(box, text=str(message), bg=bg, fg=t.get("text", "#fff"),
+                     font=("Segoe UI", 10), anchor="e", justify="right",
+                     wraplength=360).pack(fill="x", padx=16, pady=(0, 12))
+            win.bind("<Button-1>", lambda e: win.destroy())
+            for child in box.winfo_children():
+                child.bind("<Button-1>", lambda e: win.destroy())
+            win.update_idletasks()
+            sw, sh = self._screen_size()
+            ww = min(max(300, win.winfo_reqwidth()), max(320, sw - 60))
+            wh = win.winfo_reqheight()
+            win.geometry("{}x{}+{}+{}".format(ww, wh, max(20, sw - ww - 26),
+                                              max(20, sh - wh - 80)))
+            self._toast = win
+
+            def _bye(w=win):
+                try:
+                    if w.winfo_exists():
+                        w.destroy()
+                except Exception:
+                    pass
+
+            win.after(9000, _bye)
+        except Exception:
+            pass
+
+    def _apply_screen_layout(self):
+        """قياس واضح للخطوط + نافذة مناسبة للشاشة. لا نصغّر الخطوط أبداً؛
+        وإذا ضاق المكان فالتمرير يكشف بقية المحتوى بدل قصّه."""
+        sw, sh = self._screen_size()
+        # 1.0 = حد أدنى (خط واضح دائماً)، والتكبير فقط على الشاشات الكبيرة
+        dpi_k = max(1.0, min(1.6, (globals().get("SYSTEM_DPI", 96) or 96) / 96.0))
+        scale = dpi_k
+        if sw >= 1900 and sh >= 1040 and scale < 1.1:
+            scale = 1.10
+        elif sw >= 1600 and sh >= 900 and scale < 1.05:
+            scale = 1.05
+        self.ui_scale = scale
+        self.screen_w, self.screen_h = sw, sh
+        try:
+            self.root.tk.call("tk", "scaling", 1.3333 * scale)
+        except Exception:
+            pass
+        w = int(min(1280 * scale, max(880, sw - 60)))
+        h = int(min(880 * scale, max(600, sh - 90)))
+        self.root.geometry("{}x{}".format(w, h))
+        self.root.minsize(880, 560)
 
     def build_ui(self):
         t = self.theme
         BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
         GOLD, ATXT, TXT, MUT = t["accent"], t["accent_text"], t["text"], t["muted"]
-        self.root.title(self.titles.get("window", "Gold Portfolio"))
-        self.root.geometry("960x790")
-        self.root.minsize(900, 680)
         self.root.configure(bg=BG)
-        BORDER = t.get("border", "#2a3240")
+        self.root.title(self.titles.get("window", DEFAULT_TITLES["window"]))
+        self._apply_screen_layout()
+        p = self._px
+
+        # حاوية الصفحات: الرئيسية + المخطط (تنقّل داخل نفس النافذة)
+        self.page_holder = tk.Frame(self.root, bg=BG)
+        self.page_holder.pack(fill="both", expand=True)
+        # الصفحة الرئيسية داخل منطقة تمرير: لا يُقصّ أي محتوى مهما صغُر الارتفاع
+        self.main_wrap = ScrollArea(self.page_holder, BG)
+        self.main_wrap.pack(fill="both", expand=True)
+        self.main_page = self.main_wrap.inner
+        try:
+            self._apply_icon()
+        except Exception:
+            pass
+        if not getattr(self, "_wheel_bound", False):
+            self._bind_wheel()
+            self._wheel_bound = True
 
         style = ttk.Style()
         try:
@@ -418,177 +2404,283 @@ class GoldApp:
         except Exception:
             pass
         style.configure("Treeview", background=CARD, fieldbackground=CARD,
-                        foreground=TXT, rowheight=30, borderwidth=0, relief="flat")
+                        foreground=TXT, rowheight=self._px(37),
+                        font=("Segoe UI", 11), borderwidth=0,
+                        highlightthickness=0)
         style.configure("Treeview.Heading", background=CARD2, foreground=GOLD,
-                        font=("Segoe UI", 9, "bold"), relief="flat",
-                        padding=6, borderwidth=0)
-        style.map("Treeview.Heading", background=[("active", CARD2)])
-        style.map("Treeview", background=[("selected", GOLD)],
-                  foreground=[("selected", ATXT)])
-        style.configure("TMenubutton", background=CARD2, foreground=TXT,
-                        relief="flat", font=("Segoe UI", 10), padding=6,
-                        arrowcolor=GOLD)
-        style.map("TMenubutton", background=[("active", BORDER)])
+                        font=("Segoe UI", 11, "bold"), relief="flat",
+                        padding=(p(9), p(10)))
+        style.map("Treeview",
+                  background=[("selected", t.get("border", "#2c3a52"))],
+                  foreground=[("selected", "#ffffff")])
+        style.map("Treeview.Heading",
+                  background=[("active", t.get("border", "#252c39"))])
+        try:
+            style.configure("TMenubutton", background=CARD2, foreground=TXT,
+                            relief="flat", padding=(12, 5),
+                            font=("Segoe UI", 10))
+            style.map("TMenubutton",
+                      background=[("active", t.get("border", "#252c39"))])
+        except Exception:
+            pass
 
-        # شريط الرأس + زر الإعدادات
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", padx=20, pady=(14, 0))
-        self._mkbtn(head, "⚙  الإعدادات والألوان", self.open_settings,
-                    kind="ghost", font_size=9).pack(side="right")
-        tk.Label(self.root, text=self.titles.get("title", ""), bg=BG, fg=GOLD,
-                 font=("Segoe UI", 22, "bold")).pack(pady=(6, 0))
-        tk.Label(self.root, text=self.titles.get("subtitle", ""),
-                 bg=BG, fg=MUT, font=("Segoe UI", 9)).pack(pady=(2, 0))
-        tk.Frame(self.root, bg=GOLD, height=2).pack(fill="x", padx=20, pady=(10, 0))
+        # العنوان
+        hdr = tk.Frame(self.root, bg=BG)
+        hdr.pack(fill="x", padx=p(22), pady=(p(16), p(4)),
+                 before=self.page_holder)
+        compact = (getattr(self, "screen_h", 900) < 800 or
+                   getattr(self, "screen_w", 1400) < 1180)
+        tk.Label(hdr, text=self.titles.get("title"), bg=BG, fg=GOLD,
+                 font=("Segoe UI", 18 if compact else 22, "bold")).pack(side="right")
+        if not compact:
+            tk.Label(hdr, text=self.titles.get("subtitle"), bg=BG, fg=MUT,
+                     font=("Segoe UI", 10)).pack(side="right", padx=p(16))
+        if getattr(self, "user", None):
+            chip = tk.Frame(hdr, bg=BG)
+            chip.pack(side="left")
+            self.btn_privacy = self._mkbtn(
+                chip, "👁" if getattr(self, "privacy", False) else "🙈",
+                self.toggle_privacy, kind="ghost", font_size=10)
+            self.btn_privacy.pack(side="left", padx=(8, 0))
+            self._mkbtn(chip, "🌓", self.toggle_theme, kind="ghost",
+                        font_size=10).pack(side="left", padx=(4, 0))
+            self._mkbtn(chip, "الحساب", self.open_account, kind="ghost",
+                        font_size=10).pack(side="left", padx=(4, 0))
+            tk.Label(chip, text="👤  " + self.user, bg=BG, fg=TXT,
+                     font=("Segoe UI", 11, "bold")).pack(side="left")
+        tk.Frame(self.root, bg=t.get("border", "#252c39"),
+                 height=1).pack(fill="x", padx=20, pady=(4, 0),
+                                before=self.page_holder)
 
-        # بطاقات الأسعار (شبكة أفقية حديثة)
-        prices = tk.Frame(self.root, bg=BG)
-        prices.pack(fill="x", padx=15, pady=(14, 6))
+        # بطاقات الأسعار (تُحزَم لاحقاً أسفل سطر العملة والعيار)
+        prices = tk.Frame(self.main_page, bg=BG)
         self._price_card(prices, "الأونصة (عالمي)", "lbl_oz", GOLD, 0)
         self._price_card(prices, "الغرام (عالمي)", "lbl_gr", GOLD, 1)
-        self._price_card(prices, "الراجحي — شراء/غرام", "lbl_gr_buy", t["loss"], 2)
-        self._price_card(prices, "الراجحي — بيع/غرام", "lbl_gr_adj", t["profit"], 3)
+        self.card_rajhi_buy = self._price_card(
+            prices, "الراجحي — شراء/غرام", "lbl_gr_buy", t["loss"], 2)
+        self.card_rajhi_sell = self._price_card(
+            prices, "الراجحي — بيع/غرام", "lbl_gr_adj", t["profit"], 3)
 
-        # شريط التحكم
-        ctrl = tk.Frame(self.root, bg=BG)
-        ctrl.pack(fill="x", padx=20, pady=(10, 4))
-        self._mkbtn(ctrl, "⟳  تحديث السعر", self.refresh_all,
-                    kind="primary", font_size=9).pack(side="right", padx=4)
+        # الإعدادات (سطر العملة والعيار — أول عناصر الصفحة)
+        ctrl = tk.Frame(self.main_page, bg=BG)
+        ctrl.pack(fill="x", padx=p(20), pady=(p(12), p(4)))
         tk.Label(ctrl, text="العملة:", bg=BG, fg=TXT,
                  font=("Segoe UI", 10)).pack(side="right", padx=(10, 2))
-        self.cur_var = tk.StringVar(value=self.cur)
-        ttk.OptionMenu(ctrl, self.cur_var, self.cur, *CUR.keys(),
-                       command=self.on_cur_change).pack(side="right")
-        tk.Label(ctrl, text="فرق البيع/غرام:", bg=BG, fg=TXT,
-                 font=("Segoe UI", 10)).pack(side="right", padx=(10, 2))
+        self.cur_var = tk.StringVar(value="{} ({})".format(CUR[self.cur]["name"], self.cur))
+        cur_menu = ttk.OptionMenu(ctrl, self.cur_var, self.cur_var.get(),
+                                  *["{} ({})".format(v["name"], k) for k, v in CUR.items()])
+        cur_menu.pack(side="right", ipady=2)
+
+        # اختيار العيار (24 / 22 / 21 / 18)
+        tk.Label(ctrl, text="العيار:", bg=BG, fg=TXT,
+                 font=("Segoe UI", 10)).pack(side="right", padx=(14, 2))
+        self.karat_var = tk.StringVar(value="{} قيراط".format(self.karat))
+        karat_menu = ttk.OptionMenu(
+            ctrl, self.karat_var, self.karat_var.get(),
+            *["{} قيراط".format(k) for k in KARATS])
+        karat_menu.pack(side="right", ipady=2)
+        self.karat_var.trace_add("write", lambda *a: self.on_karat_change())
+
+        # فروق الراجحي (تُخفى تلقائياً عند اختيار عملة غير الريال السعودي)
+        self.rajhi_frame = tk.Frame(ctrl, bg=BG)
+        self.rajhi_frame.pack(side="right")
+
+        lbl_adj = tk.Label(self.rajhi_frame, text="فرق البيع/غرام:", bg=BG, fg=TXT,
+                           font=("Segoe UI", 10))
         self.adj_var = tk.StringVar(value=str(self.adjust))
-        adj_e = self._mkentry(ctrl, self.adj_var, width=6)
-        adj_e.pack(side="right", ipady=4)
-        adj_e.bind("<Return>", lambda e: self.on_adjust_change())
-        self.adj_var.trace_add("write", lambda *a: self.on_adjust_change())
-        tk.Label(ctrl, text="فرق الشراء/غرام:", bg=BG, fg=TXT,
-                 font=("Segoe UI", 10)).pack(side="right", padx=(10, 2))
+        self.adj_e = self._mkentry(self.rajhi_frame, self.adj_var, width=6)
+        lbl_buy = tk.Label(self.rajhi_frame, text="فرق الشراء/غرام:", bg=BG, fg=TXT,
+                           font=("Segoe UI", 10))
         self.buy_var = tk.StringVar(value=str(self.buy_margin))
-        buy_e = self._mkentry(ctrl, self.buy_var, width=6)
-        buy_e.pack(side="right", ipady=4)
-        buy_e.bind("<Return>", lambda e: self.on_buy_margin_change())
+        self.buy_e = self._mkentry(self.rajhi_frame, self.buy_var, width=6)
+        # ترتيب ثابت (من اليمين): فرق البيع، قيمته، فرق الشراء، قيمته
+        self._rajhi_kids = [
+            (lbl_adj, {"side": "right", "padx": (12, 2)}),
+            (self.adj_e, {"side": "right", "ipady": 4}),
+            (lbl_buy, {"side": "right", "padx": (12, 2)}),
+            (self.buy_e, {"side": "right", "ipady": 4}),
+        ]
+        for w, o in self._rajhi_kids:
+            w.pack(**o)
+        self.adj_var.trace_add("write", lambda *a: self.on_adjust_change())
         self.buy_var.trace_add("write", lambda *a: self.on_buy_margin_change())
 
-        updfr = tk.Frame(self.root, bg=BG)
-        updfr.pack()
-        self.dot = tk.Label(updfr, text="●", bg=BG, fg=MUT,
-                            font=("Segoe UI", 10))
+        # ربط تغيير العملة بعد جهوزية عناصر الواجهة كلها
+        self.cur_var.trace_add("write", lambda *a: self.on_currency_change())
+
+        self._mkbtn(ctrl, "⚙ الإعدادات", self.open_settings, kind="neutral",
+                    font_size=10).pack(side="left", padx=6)
+        self._mkbtn(ctrl, "🧮 حاسبة التكلفة", self.open_calc, kind="neutral",
+                    font_size=10).pack(side="left", padx=6)
+
+        # بطاقات الأسعار تحت سطر العملة والعيار مباشرة
+        prices.pack(fill="x", padx=p(16), pady=(p(8), p(8)))
+
+        # ملاحظة تظهر عند اختيار عملة غير الريال السعودي
+        self.rajhi_note = tk.Label(
+            ctrl, text="ℹ أسعار الراجحي متاحة بالريال السعودي فقط",
+            bg=BG, fg=MUT, font=("Segoe UI", 10))
+
+        # لوحة ملخص سريعة (تُقرأ بنظرة واحدة)
+        dash = tk.Frame(self.main_page, bg=BG)
+        dash.pack(fill="x", padx=p(16), pady=(p(2), p(2)))
+        self._dash_card(dash, "إجمالي الغرامات", "dash_qty", TXT, 0)
+        self._dash_card(dash, "التكلفة", "dash_cost", TXT, 1)
+        self._dash_card(dash, "القيمة الحالية", "dash_val", GOLD, 2)
+        self._dash_card(dash, "الربح غير المحقق", "dash_pl", t["profit"], 3)
+
+        # صف التحديث والمؤشر
+        updfr = tk.Frame(self.main_page, bg=BG)
+        updfr.pack(fill="x", padx=20)
+        self.dot = tk.Label(updfr, text="●", bg=BG, fg=MUT, font=("Segoe UI", 10))
         self.dot.pack(side="right", padx=(6, 0))
         self.lbl_upd = tk.Label(updfr, text="جارٍ التحميل...", bg=BG, fg=MUT,
-                                font=("Segoe UI", 8))
+                                font=("Segoe UI", 10))
         self.lbl_upd.pack(side="right")
-        # مؤشر تغيّر السعر (سهم + مقدار التغيّر منذ آخر تحديث)
         self.lbl_delta = tk.Label(updfr, text="", bg=BG, fg=MUT,
-                                  font=("Segoe UI", 9, "bold"))
-        self.lbl_delta.pack(side="right", padx=(0, 10))
+                                  font=("Segoe UI", 11, "bold"))
+        self.lbl_delta.pack(side="left", padx=(0, 0))
 
-        # نموذج الإضافة
-        form = tk.Frame(self.root, bg=CARD, highlightthickness=1,
-                        highlightbackground=BORDER)
-        form.pack(fill="x", padx=20, pady=10)
-        tk.Label(form, text="الاسم", bg=CARD, fg=MUT,
-                 font=("Segoe UI", 9)).grid(row=0, column=0, padx=8, pady=(8, 2))
-        tk.Label(form, text="الكمية", bg=CARD, fg=MUT,
-                 font=("Segoe UI", 9)).grid(row=0, column=1, padx=8)
-        tk.Label(form, text="الوحدة", bg=CARD, fg=MUT,
-                 font=("Segoe UI", 9)).grid(row=0, column=2, padx=8)
-        self.buy_lbl = tk.Label(form, text="سعر الشراء/وحدة (USD)", bg=CARD, fg=MUT,
-                                font=("Segoe UI", 9))
-        self.buy_lbl.grid(row=0, column=3, padx=8)
-        self.e_name = self._mkentry(form, width=18)
-        self.e_name.grid(row=1, column=0, padx=8, pady=(2, 10), ipady=4)
-        self.e_qty = self._mkentry(form, width=10)
-        self.e_qty.grid(row=1, column=1, padx=8, ipady=4)
-        self.unit_var = tk.StringVar(value="g")
-        ttk.OptionMenu(form, self.unit_var, "g", "g", "oz").grid(row=1, column=2, padx=8)
-        self.e_buy = self._mkentry(form, width=12)
-        self.e_buy.grid(row=1, column=3, padx=8, ipady=4)
-        self._mkbtn(form, "＋ إضافة", self.add_item, kind="primary",
-                    width=10).grid(row=1, column=4, padx=12, pady=(2, 10))
+        # شريط الإضافة: زر واحد فقط — تفاصيل العملية تُدخَل في صفحة مستقلة
+        addbar = tk.Frame(self.main_page, bg=BG)
+        addbar.pack(fill="x", padx=p(18), pady=(p(4), p(2)))
+        self.btn_add = self._mkbtn(addbar, "＋  إضافة عملية (شراء / بيع)",
+                                   self.open_add_chooser, kind="primary",
+                                   font_size=12)
+        self.btn_add.pack(side="right", pady=2)
+        tk.Label(addbar,
+                 text="اختر «شراء» أو «بيع» ثم أدخل الوزن والعيار والسعر في صفحة مستقلة",
+                 bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(side="right",
+                                                            padx=p(10))
 
         # الجدول
-        cols = ("name", "status", "qty", "buy", "cost", "cur", "val", "pl", "pct")
+        cols = ("name", "status", "qty", "buy", "cost", "cur", "val",
+                "sellprice", "pl", "pct")
         heads = ("الاسم", "الحالة", "الكمية", "سعر الشراء", "التكلفة",
-                 "السعر الحالي/البيع", "القيمة", "الربح/الخسارة", "%")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=6)
+                 "السعر الحالي", "القيمة", "سعر البيع", "الربح/الخسارة", "%")
+        _sh = getattr(self, "screen_h", 900)
+        tree_rows = 9 if _sh <= 768 else (12 if _sh <= 820 else 15)
+        tree_wrap = tk.Frame(self.main_page, bg=BG)
+        tree_wrap.pack(fill="both", expand=True, padx=p(18), pady=p(6))
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
+                                 height=tree_rows)
         for c, h in zip(cols, heads):
             self.tree.heading(c, text=h)
-            self.tree.column(c, anchor="center", width=100)
-        self.tree.column("name", width=120)
-        self.tree.column("status", width=74)
-        self.tree.column("pct", width=70)
+            self.tree.column(c, anchor="center", width=110)
+        self.tree.column("name", width=130)
+        self.tree.column("status", width=110)
+        self.tree.column("sellprice", width=125)
+        self.tree.column("pct", width=80)
+        self.tree_x = ttk.Scrollbar(tree_wrap, orient="horizontal",
+                                    command=self.tree.xview)
+        self.tree.configure(xscrollcommand=self.tree_x.set)
         self.tree.tag_configure("pos", foreground=t["profit"])
         self.tree.tag_configure("neg", foreground=t["loss"])
         self.tree.tag_configure("odd", background=t.get("row_alt", CARD))
         self.tree.tag_configure("even", background=CARD)
-        self.tree.tag_configure("total", background=t["total_bg"], foreground=t["total"],
-                                font=("Segoe UI", 9, "bold"))
-        self.tree.tag_configure("totalpos", background=t["total_bg"], foreground=t["profit"],
-                                font=("Segoe UI", 9, "bold"))
-        self.tree.tag_configure("totalneg", background=t["total_bg"], foreground=t["loss"],
-                                font=("Segoe UI", 9, "bold"))
-        self.tree.tag_configure("sold", background=t.get("card2", "#1e2530"))
-        self.tree.tag_configure("soldgreen", background=t.get("sold_bg", "#16351f"),
-                                foreground=t.get("profit", "#2ecc71"),
-                                font=("Segoe UI", 9, "bold"))
+        self.tree.tag_configure("total", background=t["total_bg"],
+                                foreground=t["total"], font=("Segoe UI", 11, "bold"))
+        self.tree.tag_configure("totalpos", background=t["total_bg"],
+                                foreground=t["profit"], font=("Segoe UI", 11, "bold"))
+        self.tree.tag_configure("totalneg", background=t["total_bg"],
+                                foreground=t["loss"], font=("Segoe UI", 11, "bold"))
+        self.tree.tag_configure("soldgreen", background=t.get("sold_bg", "#12301f"),
+                                foreground=t["profit"], font=("Segoe UI", 11, "bold"))
+        self.tree.pack(side="top", fill="both", expand=True)
+        self.tree_x.pack(side="bottom", fill="x", pady=(2, 0))
 
-        btns = tk.Frame(self.root, bg=BG)
-        self._mkbtn(btns, "🗑 حذف المحدد", self.del_item, kind="danger",
-                    font_size=9).pack(side="left", pady=4)
+        # الأزرار: كل الخيارات في شطر واحد (بلا «أمر بيع» — البيع من
+        # زر «إضافة عملية (شراء / بيع)» أو Ctrl+S)
+        btns = tk.Frame(self.main_page, bg=BG)
+        btns.pack(fill="x", padx=p(12), pady=(p(6), p(2)))
+        self._mkbtn(btns, "🗑 حذف", self.del_item, kind="danger",
+                    font_size=10).pack(side="right", padx=2)
         self._mkbtn(btns, "مسح الكل", self.clear_all, kind="neutral",
-                    font_size=9).pack(side="left", padx=6)
-        self._mkbtn(btns, "💰 أمر بيع", self.open_sell, kind="neutral",
-                    font_size=9).pack(side="left", padx=6)
-        self._mkbtn(btns, "📜 سجل العمليات", self.open_history, kind="neutral",
-                    font_size=9).pack(side="left", padx=6)
-        self._mkbtn(btns, "📐 حاسبة الزكاة", self.open_zakat, kind="neutral",
-                    font_size=9).pack(side="left", padx=6)
-        self._mkbtn(btns, "📈 مخطط اليوم", self.open_chart, kind="neutral",
-                    font_size=9).pack(side="left", padx=6)
-        self._mkbtn(btns, "🔔 إضافة تنبيه السعر", self.open_alerts, kind="primary",
-                    font_size=9).pack(side="left", padx=6)
-        self._mkbtn(btns, "⬇ تصدير Excel", self.export_excel, kind="success",
-                    font_size=9).pack(side="left", padx=6)
+                    font_size=10).pack(side="right", padx=2)
+        self._mkbtn(btns, "📜 السجل", self.open_history, kind="neutral",
+                    font_size=10).pack(side="right", padx=2)
+        self._mkbtn(btns, "⬇ Excel", self.export_excel, kind="success",
+                    font_size=10).pack(side="right", padx=2)
+        self._mkbtn(btns, "🔔 تنبيه", self.open_alerts, kind="primary",
+                    font_size=10).pack(side="left", padx=2)
+        self._mkbtn(btns, "📈 المخطط", self.show_chart, kind="primary",
+                    font_size=10).pack(side="left", padx=2)
+        self._mkbtn(btns, "📐 الزكاة", self.open_zakat, kind="neutral",
+                    font_size=10).pack(side="left", padx=2)
+        self.btn_widget = self._mkbtn(btns, "🪟 ويدجيت", self.toggle_widget,
+                                      kind="neutral", font_size=10)
+        self.btn_widget.pack(side="left", padx=2)
+        self._paint_widget_btn()
 
-        # مراجع عناصر نافذة التنبيهات (تُنشأ عند فتحها فقط)
-        self.al_win = None
-        self.al_list = None
-        self.al_price = None
-        self.al_cur_lbl = None
-        self.al_metric = None
-        self.al_op = None
+        # الملخص
+        self.lbl_sum = tk.Label(self.main_page, text="", bg=BG, fg=t["total"],
+                                font=("Segoe UI", 11, "bold"))
+        self.lbl_sum.pack(fill="x", padx=p(20), pady=p(10))
+        self._update_rajhi_visibility()
 
-        self.lbl_sum = tk.Label(self.root, text="", bg=t["total_bg"], fg=t["total"],
-                                font=("Segoe UI", 11, "bold"), pady=10)
-        # ترتيب العرض: الأزرار والإجمالي بالأسفل والجدول يتمدد لأكبر مساحة
-        self.lbl_sum.pack(side="bottom", fill="x", padx=20, pady=(0, 10))
-        btns.pack(side="bottom", fill="x", padx=20, pady=(0, 4))
-        self.tree.pack(side="top", fill="both", expand=True, padx=20, pady=6)
-        self.update_buy_label()
+        # صفحة المخطط (مخفية حتى يُطلب عرضها)
+        self.chart_page = tk.Frame(self.page_holder, bg=BG)
+        self._build_chart_page()
+        self._show_page(getattr(self, "_page", "main"))
 
-    def update_buy_label(self):
-        self.buy_lbl.config(text="سعر الشراء/وحدة ({})".format(CUR[self.cur]["name"]))
-        lbl = getattr(self, "al_cur_lbl", None)
-        if lbl is not None:
+
+    # ============================ أحداث الإعدادات ============================
+    def on_currency_change(self):
+        txt = self.cur_var.get()
+        for k, v in CUR.items():
+            if txt == "{} ({})".format(v["name"], k):
+                self.cur = k
+                break
+        self._update_rajhi_visibility()
+        self.save()
+        self.render()
+
+    def _update_rajhi_visibility(self):
+        """إظهار أسعار الراجحي وفروقه فقط عند اختيار الريال السعودي."""
+        show = (self.cur == "SAR")
+        for card in (getattr(self, "card_rajhi_buy", None),
+                     getattr(self, "card_rajhi_sell", None)):
+            if card is None:
+                continue
             try:
-                lbl.config(text="(" + CUR[self.cur]["name"] + ")")
+                grid = card.grid_info()
+                if show and not grid:
+                    card.grid()
+                elif not show and grid:
+                    card.grid_remove()
             except Exception:
                 pass
+        note = getattr(self, "rajhi_note", None)
+        if note is not None:
+            try:
+                if show and note.winfo_manager():
+                    note.pack_forget()
+                elif not show and not note.winfo_manager():
+                    note.pack(side="left", padx=6)
+            except Exception:
+                pass
+        kids = getattr(self, "_rajhi_kids", None)
+        if kids:
+            visible = bool(kids[0][0].winfo_manager())
+            if show and not visible:
+                for w, o in kids:
+                    w.pack(**o)
+            elif not show and visible:
+                for w, _o in kids:
+                    w.pack_forget()
 
-    def eff_price_metric(self, metric):
-        """السعر الفعلي (بعد الطرح) للوحدة بالعملة المعروضة الحالية."""
-        g = self.gram_eff_disp()
-        return g * OZ_TO_G if metric == "oz" else g
-
-    # ---------- الأحداث ----------
-    def on_cur_change(self, *a):
-        self.cur = self.cur_var.get()
-        self.update_buy_label()
+    def on_karat_change(self):
+        txt = str(self.karat_var.get()).split()[0]
+        try:
+            k = int(txt)
+        except (TypeError, ValueError):
+            return
+        if k not in KARATS or k == self.karat:
+            return
+        self.karat = k
+        fv = getattr(self, "form_karat_var", None)
+        if fv is not None:
+            fv.set("{} قيراط".format(k))
         self.save()
         self.render()
 
@@ -608,40 +2700,268 @@ class GoldApp:
         self.save()
         self.render()
 
-    def add_item(self):
-        name = self.e_name.get().strip()
+    # ==================== إضافة عملية (شراء / بيع) ====================
+    def _close_chooser(self):
+        win = getattr(self, "_choice_win", None)
+        self._choice_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def open_add_chooser(self):
+        """نافذة صغيرة: شراء أم بيع؟ ثم تنتقل لصفحة التفاصيل."""
+        if not getattr(self, "user", None):
+            return
+        t = self.theme
+        self._close_chooser()
+        win = tk.Toplevel(self.root)
+        self._choice_win = win
         try:
-            qty = float(self.e_qty.get())
-            buy_disp = float(self.e_buy.get())
-        except ValueError:
-            messagebox.showwarning("تنبيه", "الرجاء إدخال كمية وسعر شراء صحيحين")
+            win.title("إضافة عملية")
+            win.configure(bg=t["bg"])
+            win.transient(self.root)
+            win.resizable(False, False)
+        except Exception:
+            pass
+        w, h = self._px(470), self._px(270)
+        sw, sh = self._screen_size()
+        try:
+            win.geometry("{}x{}+{}+{}".format(w, h, max(0, (sw - w) // 2),
+                                               max(0, (sh - h) // 3)))
+        except Exception:
+            pass
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        tk.Label(win, text="إضافة عملية جديدة", bg=t["bg"], fg=t["accent"],
+                 font=("Segoe UI", 15, "bold")).pack(pady=(self._px(18), 2))
+        tk.Label(win, text="اختر نوع العملية للمتابعة إلى صفحة التفاصيل",
+                 bg=t["bg"], fg=t["muted"],
+                 font=("Segoe UI", 10)).pack()
+
+        row = tk.Frame(win, bg=t["bg"])
+        row.pack(fill="both", expand=True, padx=self._px(14),
+                 pady=self._px(14))
+
+        def choose(kind):
+            self._close_chooser()
+            if kind == "buy":
+                self.open_add_buy()
+            else:
+                self.open_sell()
+
+        self._mkbtn(row, "🟢  شراء (إضافة رصيد)",
+                    lambda: choose("buy"), kind="success",
+                    font_size=12).pack(side="right", fill="both",
+                                       expand=True, padx=self._px(6),
+                                       ipady=self._px(22))
+        self._mkbtn(row, "🔴  بيع (من الرصيد)",
+                    lambda: choose("sell"), kind="danger",
+                    font_size=12).pack(side="right", fill="both",
+                                       expand=True, padx=self._px(6),
+                                       ipady=self._px(22))
+        self._mkbtn(win, "إلغاء", self._close_chooser, kind="neutral",
+                    font_size=10).pack(pady=(0, self._px(12)))
+        try:
+            win.bind("<Escape>", lambda e: self._close_chooser())
+            win.protocol("WM_DELETE_WINDOW", self._close_chooser)
+        except Exception:
+            pass
+
+    def _addbuy_total(self):
+        """يعرض إجمالي التكلفة (الوزن × سعر الوحدة) أثناء الكتابة."""
+        lbl = getattr(self, "ab_total", None)
+        if lbl is None:
+            return
+        try:
+            qty = float(str(self.ab_qty.get()).strip() or 0)
+            price = float(str(self.ab_price.get()).strip() or 0)
+        except (TypeError, ValueError):
+            qty = price = 0.0
+        try:
+            lbl.config(text=self._hide("{}{:,.2f}".format(
+                CUR[self.cur]["sym"], qty * price)))
+        except Exception:
+            pass
+
+    def _addbuy_use_price(self):
+        """يملأ السعر بسعر الراجحي/السوق الحالي للعيار والوحدة المختارين."""
+        try:
+            unit = UNIT_MAP.get(self.ab_unit.get(), "g")
+            k = int(str(self.ab_karat.get()).split()[0])
+        except (TypeError, ValueError):
+            unit, k = "g", 24
+        val = self.current_per_unit_disp(unit, k)
+        if not val:
+            messagebox.showinfo("السعر الحالي",
+                                "لم يُجلب سعر السوق بعد — اضغط ⟳ في الأعلى أولاً.")
+            return
+        self.ab_price.set("{:.2f}".format(val))
+        self._addbuy_total()
+
+    def _addbuy_clear(self):
+        for v in (getattr(self, "ab_name", None), getattr(self, "ab_qty", None),
+                  getattr(self, "ab_price", None)):
+            if v is not None:
+                try:
+                    v.set("")
+                except Exception:
+                    pass
+        self._addbuy_total()
+
+    def open_add_buy(self):
+        """صفحة تفاصيل عملية الشراء: الاسم والوزن والوحدة والعيار وسعر الشراء."""
+        if not getattr(self, "user", None):
+            return
+        t = self.theme
+        CARD, MUT, GOLD = t["card"], t["muted"], t["accent"]
+        body = self._open_page("addbuy", "＋ إضافة عملية شراء")
+        body.title("＋ إضافة عملية شراء")
+
+        self.ab_name = tk.StringVar()
+        self.ab_qty = tk.StringVar()
+        self.ab_price = tk.StringVar()
+        self.ab_unit = tk.StringVar(value="غرام")
+        self.ab_karat = tk.StringVar(value="{} قيراط".format(self.karat))
+
+        card = tk.Frame(body, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        card.pack(fill="x", padx=self._px(4), pady=(0, self._px(6)))
+        tk.Label(card, text="تفاصيل العملية", bg=CARD, fg=GOLD, anchor="e",
+                 font=("Segoe UI", 12, "bold")).pack(
+            fill="x", padx=self._px(16), pady=(self._px(12), 0))
+        tk.Frame(card, bg=t.get("border", "#252c39"), height=1).pack(
+            fill="x", padx=self._px(14), pady=(self._px(8), 0))
+
+        grid = tk.Frame(card, bg=CARD)
+        grid.pack(fill="x", padx=self._px(10), pady=(self._px(6), self._px(14)))
+        for c in (0, 1):
+            grid.columnconfigure(c, weight=1, uniform="ab")
+
+        def entry(parent, var, fsize=12):
+            return tk.Entry(parent, textvariable=var, justify="center",
+                            bg=t.get("entry_bg", "#151a23"), fg=t["text"],
+                            insertbackground=t["text"], relief="flat", bd=0,
+                            highlightthickness=1,
+                            highlightbackground=t.get("border", "#252c39"),
+                            highlightcolor=t["accent"],
+                            font=("Segoe UI", fsize))
+
+        def cell(row, col, label, builder, hint=""):
+            box = tk.Frame(grid, bg=CARD)
+            box.grid(row=row, column=col, sticky="ew", padx=self._px(8),
+                     pady=self._px(5))
+            tk.Label(box, text=label, bg=CARD, fg=MUT, anchor="e",
+                     font=("Segoe UI", 10)).pack(fill="x")
+            wdg = builder(box)
+            wdg.pack(fill="x", ipady=self._px(5), pady=(self._px(4), 0))
+            if hint:
+                tk.Label(box, text=hint, bg=CARD, fg=MUT, anchor="e",
+                         font=("Segoe UI", 10)).pack(fill="x")
+            return wdg
+
+        self.ab_name_e = cell(0, 1, "اسم العملية",
+                              lambda p: entry(p, self.ab_name),
+                              hint="مثال: سبيكة 10 غرام")
+        self.ab_qty_e = cell(0, 0, "الوزن", lambda p: entry(p, self.ab_qty),
+                             hint="بالوحدة المختارة")
+        cell(1, 1, "الوحدة",
+             lambda p: ttk.OptionMenu(p, self.ab_unit, self.ab_unit.get(),
+                                      "غرام", "أونصة"))
+        cell(1, 0, "العيار",
+             lambda p: ttk.OptionMenu(p, self.ab_karat, self.ab_karat.get(),
+                                      *["{} قيراط".format(k) for k in KARATS]))
+        self.ab_price_e = cell(2, 1, "سعر الشراء للوحدة",
+                               lambda p: entry(p, self.ab_price),
+                               hint="بالعملة الحالية: {}".format(
+                                   CUR[self.cur]["name"]))
+        tot_box = tk.Frame(grid, bg=CARD)
+        tot_box.grid(row=2, column=0, sticky="ew", padx=self._px(8),
+                     pady=self._px(5))
+        tk.Label(tot_box, text="إجمالي التكلفة", bg=CARD, fg=MUT, anchor="e",
+                 font=("Segoe UI", 10)).pack(fill="x")
+        self.ab_total = tk.Label(tot_box, text="--", bg=CARD, fg=GOLD,
+                                 anchor="e", font=("Segoe UI", 16, "bold"))
+        self.ab_total.pack(fill="x", pady=(self._px(4), 0))
+
+        for v in (self.ab_qty, self.ab_price):
+            try:
+                v.trace_add("write", lambda *a: self._addbuy_total())
+            except Exception:
+                pass
+
+        bar = tk.Frame(body, bg=t["bg"])
+        bar.pack(fill="x", padx=self._px(4), pady=(self._px(2), self._px(8)))
+        self._mkbtn(bar, "💾  حفظ العملية", self.add_item, kind="primary",
+                    font_size=12).pack(side="right")
+        self._mkbtn(bar, "⟲  السعر الحالي", self._addbuy_use_price,
+                    kind="neutral", font_size=10).pack(side="right",
+                                                       padx=self._px(8))
+        self._mkbtn(bar, "🧹  تفريغ الحقول", self._addbuy_clear,
+                    kind="ghost", font_size=10).pack(side="left")
+
+        tk.Label(body, text="💡 تُخزَّن العملية داخلياً بالدولار وتُعرض بعملتك الحالية،"
+                            " ويمكنك بيعها لاحقاً من «أمر بيع».",
+                 bg=t["bg"], fg=MUT, anchor="e", justify="right",
+                 font=("Segoe UI", 10)).pack(fill="x", padx=self._px(10))
+
+        self._addbuy_total()
+        try:
+            self.ab_name_e.focus_set()
+        except Exception:
+            pass
+
+    # ============================ عمليات الشراء ============================
+    def add_item(self):
+        """حفظ عملية الشراء من صفحة التفاصيل (بعد التحقق من المدخلات)."""
+        name = str(getattr(self, "ab_name", tk.StringVar()).get()).strip()
+        try:
+            qty = float(str(self.ab_qty.get()).strip())
+            buy_disp = float(str(self.ab_price.get()).strip())
+        except (TypeError, ValueError, AttributeError):
+            messagebox.showwarning("تنبيه", "أدخل الوزن وسعر الشراء كأرقام صحيحة")
             return
         if qty <= 0 or buy_disp <= 0:
-            messagebox.showwarning("تنبيه", "الكمية والسعر يجب أن يكونا أكبر من صفر")
+            messagebox.showwarning("تنبيه", "الوزن والسعر يجب أن يكونا أكبر من صفر")
             return
-        buy_usd = buy_disp / self.rate()   # تخزين داخلي بالدولار
-        unit = self.unit_var.get()
-        self.holdings.append({"name": name or "بدون اسم", "qty": qty,
-                              "unit": unit, "buy": buy_usd})
+        buy_usd = buy_disp / self.rate()
+        unit = UNIT_MAP.get(self.ab_unit.get(), "g")
+        try:
+            item_karat = int(str(self.ab_karat.get()).split()[0])
+        except (TypeError, ValueError):
+            item_karat = 24
+        if item_karat not in KARATS:
+            item_karat = 24
+        name = name or "بدون اسم"
+        self.holdings.append({"name": name, "qty": qty, "unit": unit,
+                              "buy": buy_usd, "karat": item_karat})
         factor = OZ_TO_G if unit == "oz" else 1
         self.history.append({
-            "type": "buy",
-            "name": name or "بدون اسم",
-            "qty_g": qty * factor,
-            "price_usd": buy_usd / factor,     # دولار/غرام
-            "amount_usd": qty * buy_usd,        # إجمالي التكلفة (دولار)
+            "type": "buy", "name": name,
+            "qty_g": qty * factor, "price_usd": buy_usd / factor,
+            "amount_usd": qty * buy_usd, "karat": item_karat,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         })
         self.save()
-        self.e_name.delete(0, "end"); self.e_qty.delete(0, "end"); self.e_buy.delete(0, "end")
         self.render()
+        self._close_page("addbuy")
+        try:
+            self.toast("تمت إضافة العملية",
+                       "{} — {:g} {} (عيار {}) بسعر {}{:,.2f}".format(
+                           name, qty, "أونصة" if unit == "oz" else "غرام",
+                           item_karat, CUR[self.cur]["sym"], buy_disp))
+        except Exception:
+            pass
 
     def del_item(self):
         sel = self.tree.selection()
         if not sel:
             return
-        iid = sel[0]
-        kind_idx = getattr(self, "row_map", {}).get(iid)
+        kind_idx = self.row_map.get(sel[0])
         if not kind_idx:
             return
         kind, idx = kind_idx
@@ -651,13 +2971,12 @@ class GoldApp:
             self.render()
         elif kind == "sell" and 0 <= idx < len(self.sells):
             if messagebox.askyesno("تراجع عن بيع",
-                                   "حذف عملية البيع؟ ستُعاد الكمية المباعة إلى الرصيد."):
+                                   "حذف عملية البيع؟ ستُعاد الكمية إلى الرصيد."):
                 s = self.sells.pop(idx)
-                # إعادة الكمية المباعة كمركز مفتوح بنفس تكلفتها
-                qty_g = s["qty_g"]
-                buy_per_g = (s["cost"] / qty_g) if qty_g else 0.0
                 self.holdings.append({"name": s.get("name", "مُسترد"),
-                                      "qty": qty_g, "unit": "g", "buy": buy_per_g})
+                                      "qty": s["qty"], "unit": s.get("unit", "g"),
+                                      "buy": s.get("buy", 0),
+                                      "karat": s.get("karat", 24)})
                 self.save()
                 self.render()
 
@@ -669,108 +2988,124 @@ class GoldApp:
             self.save()
             self.render()
 
-    # ---------- مساعدات الكمية/التكلفة ----------
-    def total_open_grams(self):
-        """إجمالي الغرامات المتاحة (الرصيد المفتوح)."""
-        return sum(h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
-                   for h in self.holdings)
-
-    def avg_buy_per_gram_usd(self):
-        """متوسط سعر الشراء للغرام (دولار) عبر كل المراكز المفتوحة."""
-        g = self.total_open_grams()
-        if not g:
-            return 0.0
-        cost = sum(h["qty"] * h["buy"] for h in self.holdings)   # إجمالي التكلفة بالدولار
-        return cost / g
-
-    def _consume_grams(self, grams):
-        """خصم (grams) غراماً من المراكز بأسلوب FIFO، وإرجاع تكلفة المخصوم بالدولار."""
-        remaining = grams
-        cost = 0.0
-        i = 0
-        while remaining > 1e-9 and i < len(self.holdings):
-            h = self.holdings[i]
-            factor = OZ_TO_G if h["unit"] == "oz" else 1
-            g_avail = h["qty"] * factor
-            buy_per_g = h["buy"] / factor
-            take = min(remaining, g_avail)
-            cost += take * buy_per_g
-            new_g = g_avail - take
-            if new_g <= 1e-9:
-                del self.holdings[i]
-            else:
-                h["qty"] = new_g / factor
-                i += 1
-            remaining -= take
-        return cost
-
-    # ---------- أمر بيع ----------
+    # ============================ أمر البيع ============================
     def open_sell(self):
-        total_g = self.total_open_grams()
-        if total_g <= 1e-9:
+        if not self.holdings:
             messagebox.showinfo("أمر بيع", "لا يوجد رصيد مفتوح لبيعه")
             return
         t = self.theme
-        BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
-        GOLD, ATXT, TXT, MUT = t["accent"], t["accent_text"], t["text"], t["muted"]
-        win = tk.Toplevel(self.root)
-        win.title("أمر بيع")
-        win.configure(bg=BG)
-        win.geometry("520x340")
-        win.transient(self.root)
-
-        frm = tk.LabelFrame(win, text="💰 بيع كمية من الذهب", bg=CARD, fg=GOLD,
-                            font=("Segoe UI", 10, "bold"))
-        frm.pack(fill="both", expand=True, padx=12, pady=12)
+        BG, CARD = t["bg"], t["card"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
         sym = CUR[self.cur]["sym"]
-        cur_sell_disp = self.gram_eff_disp()      # سعر الراجحي للبيع (للغرام) بالعملة الحالية
-        avg_buy_disp = self.avg_buy_per_gram_usd() * self.rate()
+        win = self._open_page("sell", "أمر بيع — اختر عملية الشراء")
+        win.configure(bg=BG)
+        win.geometry("560x460")
+        win.transient(self.root)
+        win.grab_set()
 
-        tk.Label(frm, text="الرصيد المتاح: {:,.3f} غرام  •  متوسط الشراء: {}{:,.2f}/غرام".format(
-            total_g, sym, avg_buy_disp), bg=CARD, fg=MUT,
-            font=("Segoe UI", 9)).pack(anchor="e", padx=10, pady=(6, 2))
+        frm = tk.LabelFrame(win, text="  💰 بيع من عمليات الشراء  ", bg=CARD, fg=GOLD,
+                            font=("Segoe UI", 11, "bold"), bd=0,
+                            highlightthickness=1,
+                            highlightbackground=t.get("border", "#252c39"))
+        frm.pack(fill="both", expand=True, padx=4, pady=8)
 
-        # الكمية بالغرام
-        r2 = tk.Frame(frm, bg=CARD); r2.pack(fill="x", padx=6, pady=8)
-        tk.Label(r2, text="الكمية المباعة (غرام):", bg=CARD, fg=TXT).pack(side="right")
-        e_qty = tk.Entry(r2, width=12)
-        e_qty.insert(0, "{:g}".format(round(total_g, 3)))
-        e_qty.pack(side="right", padx=6)
-        tk.Label(r2, text="(الأقصى {:,.3f})".format(total_g), bg=CARD, fg=MUT,
-                 font=("Segoe UI", 8)).pack(side="right", padx=4)
+        tk.Label(frm, text="اختر عملية الشراء التي تريد بيعها:", bg=CARD, fg=TXT,
+                 font=("Segoe UI", 10)).pack(anchor="e", padx=10, pady=(8, 2))
+        # قائمة عمليات الشراء المفتوحة
+        list_fr = tk.Frame(frm, bg=CARD)
+        list_fr.pack(fill="x", padx=10, pady=4)
+        sb = tk.Scrollbar(list_fr)
+        sb.pack(side="left", fill="y")
+        lb = tk.Listbox(list_fr, height=6, bg=t.get("entry_bg", "#151a23"),
+                        fg=TXT, selectbackground=t.get("border", "#2c3a52"),
+                        selectforeground="#ffffff", relief="flat", bd=0,
+                        highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"),
+                        font=("Segoe UI", 11), yscrollcommand=sb.set)
+        lb.pack(side="right", fill="x", expand=True)
+        sb.config(command=lb.yview)
+        for i, h in enumerate(self.holdings):
+            ut = "أونصة" if h["unit"] == "oz" else "غرام"
+            lb.insert("end", "{}. {} — {:g} {} (عيار {}) @ {}{:,.2f}".format(
+                i + 1, h["name"], h["qty"], ut, h.get("karat", 24), sym,
+                h["buy"] * self.rate()))
+        lb.selection_set(0)
 
-        # سعر البيع للغرام (افتراضي: سعر الراجحي للبيع الحالي)
-        r3 = tk.Frame(frm, bg=CARD); r3.pack(fill="x", padx=6, pady=8)
-        tk.Label(r3, text="سعر البيع/غرام ({}):".format(CUR[self.cur]["name"]),
-                 bg=CARD, fg=TXT).pack(side="right")
-        e_price = tk.Entry(r3, width=12)
-        if cur_sell_disp:
-            e_price.insert(0, "{:.2f}".format(cur_sell_disp))
-        e_price.pack(side="right", padx=6)
-        tk.Label(r3, text="(سعر الراجحي للبيع الآن)", bg=CARD, fg=MUT,
-                 font=("Segoe UI", 8)).pack(side="right", padx=4)
+        # الكمية
+        r2 = tk.Frame(frm, bg=CARD)
+        r2.pack(fill="x", padx=10, pady=6)
+        tk.Label(r2, text="الكمية المباعة:", bg=CARD, fg=TXT,
+                 font=("Segoe UI", 10)).pack(side="right")
+        e_qty = self._mkentry(r2, tk.StringVar(), width=12)
+        e_qty.pack(side="right", padx=6, ipady=4)
+        lbl_max = tk.Label(r2, text="", bg=CARD, fg=MUT, font=("Segoe UI", 10))
+        lbl_max.pack(side="right", padx=4)
 
-        lbl_prev = tk.Label(frm, text="", bg=CARD, fg=GOLD, font=("Segoe UI", 9, "bold"))
-        lbl_prev.pack(anchor="e", padx=10, pady=4)
+        # سعر البيع
+        r3 = tk.Frame(frm, bg=CARD)
+        r3.pack(fill="x", padx=10, pady=6)
+        tk.Label(r3, text="سعر البيع/وحدة ({}):".format(CUR[self.cur]["name"]),
+                 bg=CARD, fg=TXT, font=("Segoe UI", 10)).pack(side="right")
+        e_price = self._mkentry(r3, tk.StringVar(), width=12)
+        e_price.pack(side="right", padx=6, ipady=4)
+        tk.Label(r3, text=("(الراجحي للبيع الآن)" if self.cur == "SAR"
+                           else "(السعر العالمي الآن)"),
+                 bg=CARD, fg=MUT,
+                 font=("Segoe UI", 10)).pack(side="right", padx=4)
+
+        lbl_prev = tk.Label(frm, text="", bg=CARD, fg=GOLD,
+                            font=("Segoe UI", 11, "bold"), justify="right")
+        lbl_prev.pack(anchor="e", padx=12, pady=6)
+
+        def sel_index():
+            s = lb.curselection()
+            return s[0] if s else 0
+
+        def on_select(*_):
+            i = sel_index()
+            if i >= len(self.holdings):
+                return
+            h = self.holdings[i]
+            ut = "أونصة" if h["unit"] == "oz" else "غرام"
+            e_qty.delete(0, "end")
+            e_qty.insert(0, "{:g}".format(h["qty"]))
+            lbl_max.config(text="(الأقصى {:g} {})".format(h["qty"], ut))
+            cur = self.current_per_unit_disp(h["unit"], h.get("karat", 24))
+            if cur:
+                e_price.delete(0, "end")
+                e_price.insert(0, "{:.2f}".format(cur))
+            preview()
 
         def preview(*_):
+            i = sel_index()
+            if i >= len(self.holdings):
+                lbl_prev.config(text="")
+                return
+            h = self.holdings[i]
             try:
-                qty = float(e_qty.get()); price_disp = float(e_price.get())
+                qty = float(e_qty.get())
+                price_disp = float(e_price.get())
             except ValueError:
-                lbl_prev.config(text=""); return
+                lbl_prev.config(text="")
+                return
             if qty <= 0 or price_disp <= 0:
-                lbl_prev.config(text=""); return
-            qty = min(qty, total_g)
+                lbl_prev.config(text="")
+                return
             val = qty * price_disp
-            cost = qty * avg_buy_disp
+            cost = qty * h["buy"] * self.rate()
             pl = val - cost
-            lbl_prev.config(text="قيمة البيع: {s}{v:,.2f}  •  الربح/الخسارة: {sg}{s}{p:,.2f}".format(
+            lbl_prev.config(text="قيمة البيع: {s}{v:,.2f}\nالربح/الخسارة: {sg}{s}{p:,.2f}".format(
                 s=sym, v=val, p=pl, sg="+" if pl > 0 else ""))
+
+        lb.bind("<<ListboxSelect>>", on_select)
         e_qty.bind("<KeyRelease>", preview)
         e_price.bind("<KeyRelease>", preview)
-        preview()
 
         def do_sell():
+            i = sel_index()
+            if i >= len(self.holdings):
+                return
+            h = self.holdings[i]
             try:
                 qty = float(e_qty.get())
                 price_disp = float(e_price.get())
@@ -780,60 +3115,65 @@ class GoldApp:
             if qty <= 0 or price_disp <= 0:
                 messagebox.showwarning("تنبيه", "الكمية والسعر يجب أن يكونا أكبر من صفر", parent=win)
                 return
-            if qty > total_g + 1e-6:
-                messagebox.showwarning("تنبيه", "الكمية المباعة أكبر من الرصيد المتاح", parent=win)
+            if qty > h["qty"] + 1e-9:
+                messagebox.showwarning("تنبيه", "الكمية أكبر من المتاح في هذه العملية", parent=win)
                 return
-            qty = min(qty, total_g)
-            sell_usd = price_disp / self.rate()        # تثبيت سعر البيع (داخلياً بالدولار)
-            cost_usd = self._consume_grams(qty)        # خصم الكمية + تكلفتها FIFO
+            sell_usd = price_disp / self.rate()
             sell_date = datetime.now().strftime("%Y-%m-%d %H:%M")
             self.sells.append({
-                "name": "بيع ذهب",
-                "qty_g": qty,
-                "sell": sell_usd,          # دولار/غرام (مثبّت)
-                "cost": cost_usd,          # تكلفة المخصوم (دولار)
+                "name": h["name"],
+                "qty": qty,
+                "unit": h["unit"],
+                "buy": h["buy"],
+                "sell": sell_usd,
+                "karat": h.get("karat", 24),
                 "date": sell_date,
             })
+            factor = OZ_TO_G if h["unit"] == "oz" else 1
             self.history.append({
-                "type": "sell",
-                "name": "بيع ذهب",
-                "qty_g": qty,
-                "price_usd": sell_usd,              # دولار/غرام
-                "amount_usd": qty * sell_usd,       # قيمة البيع (دولار)
-                "cost_usd": cost_usd,               # تكلفة المباع (دولار)
-                "pl_usd": qty * sell_usd - cost_usd, # الربح/الخسارة المحقق (دولار)
+                "type": "sell", "name": h["name"],
+                "qty_g": qty * factor, "price_usd": sell_usd / factor,
+                "amount_usd": qty * sell_usd,
+                "cost_usd": qty * h["buy"],
+                "pl_usd": qty * (sell_usd - h["buy"]),
+                "karat": h.get("karat", 24),
                 "date": sell_date,
             })
+            # خصم الكمية من عملية الشراء
+            if abs(qty - h["qty"]) < 1e-9:
+                del self.holdings[i]
+            else:
+                h["qty"] -= qty
             self.save()
             self.render()
             win.destroy()
 
-        bar = tk.Frame(frm, bg=CARD); bar.pack(fill="x", padx=6, pady=14)
-        self._mkbtn(bar, "✔ تأكيد البيع", do_sell, kind="success",
-                    font_size=9).pack(side="right", padx=6)
-        self._mkbtn(bar, "إلغاء", win.destroy, kind="neutral",
-                    font_size=9).pack(side="right", padx=6)
-        tk.Label(frm, text="يُخصم المباع من الرصيد (FIFO) ويُثبّت سعر البيع لحساب الربح المحقق.",
-                 bg=CARD, fg=MUT, font=("Segoe UI", 8)).pack(anchor="e", padx=10)
+        on_select()
 
-    # ---------- سجل العمليات ----------
+        bar = tk.Frame(frm, bg=CARD)
+        bar.pack(fill="x", padx=10, pady=12)
+        self._mkbtn(bar, "✔ تأكيد البيع", do_sell, kind="success",
+                    font_size=10).pack(side="right", padx=6)
+        self._mkbtn(bar, "إلغاء", win.destroy, kind="neutral",
+                    font_size=10).pack(side="right", padx=6)
+        tk.Label(frm, text="سعر البيع يُثبّت عند لحظة البيع ويُحسب الربح/الخسارة عليه.",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(anchor="e", padx=12)
+
+    # ============================ سجل العمليات ============================
     def open_history(self):
         t = self.theme
-        BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
+        BG, CARD = t["bg"], t["card"]
         GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
         sym = CUR[self.cur]["sym"]
-        win = tk.Toplevel(self.root)
-        win.title("سجل العمليات")
+        win = self._open_page("history", "سجل العمليات")
         win.configure(bg=BG)
-        win.geometry("760x440")
+        win.geometry("800x460")
         win.transient(self.root)
-        tk.Label(win, text="📜 سجل كل العمليات", bg=BG, fg=GOLD,
-                 font=("Segoe UI", 12, "bold")).pack(anchor="e", padx=14, pady=(12, 4))
 
         cols = ("date", "type", "name", "qty", "price", "amount", "pl")
         heads = ("التاريخ", "النوع", "الاسم", "الكمية (غ)",
                  "السعر/غ", "القيمة", "الربح/الخسارة")
-        tv = ttk.Treeview(win, columns=cols, show="headings", height=14)
+        tv = ttk.Treeview(win, columns=cols, show="headings", height=15)
         for c, h in zip(cols, heads):
             tv.heading(c, text=h)
             tv.column(c, anchor="center", width=100)
@@ -842,7 +3182,7 @@ class GoldApp:
         tv.tag_configure("buy", foreground=t.get("accent", "#e3b23c"))
         tv.tag_configure("sellpos", foreground=t.get("profit", "#2ecc71"))
         tv.tag_configure("sellneg", foreground=t.get("loss", "#ff5c5c"))
-        tv.pack(fill="both", expand=True, padx=12, pady=8)
+        tv.pack(fill="both", expand=True, padx=4, pady=(10, 8))
 
         tot_buy = tot_sell = tot_pl = 0.0
         for e in self.history:
@@ -851,7 +3191,9 @@ class GoldApp:
             if e.get("type") == "buy":
                 tot_buy += amount
                 tv.insert("", "end", tags=("buy",), values=(
-                    e.get("date", ""), "▲ شراء", e.get("name", ""),
+                    e.get("date", ""),
+                    "▲ شراء ({})".format(e.get("karat", 24)) if e.get("karat") else "▲ شراء",
+                    e.get("name", ""),
                     "{:g}".format(round(e.get("qty_g", 0), 3)),
                     "{}{:,.2f}".format(sym, price),
                     "{}{:,.2f}".format(sym, amount), "-"))
@@ -861,16 +3203,20 @@ class GoldApp:
                 tot_pl += pl
                 tag = "sellpos" if pl >= 0 else "sellneg"
                 tv.insert("", "end", tags=(tag,), values=(
-                    e.get("date", ""), "▼ بيع", e.get("name", ""),
+                    e.get("date", ""),
+                    "▼ بيع ({})".format(e.get("karat", 24)) if e.get("karat") else "▼ بيع",
+                    e.get("name", ""),
                     "{:g}".format(round(e.get("qty_g", 0), 3)),
                     "{}{:,.2f}".format(sym, price),
                     "{}{:,.2f}".format(sym, amount),
                     "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl)))
 
-        info = ("إجمالي الشراء: {s}{b:,.2f}    |    إجمالي البيع: {s}{sl:,.2f}    |    الربح المحقق: {sg}{s}{p:,.2f}").format(
+        info = ("إجمالي الشراء: {s}{b:,.2f}    |    إجمالي البيع: {s}{sl:,.2f}    |    "
+                "الربح المحقق: {sg}{s}{p:,.2f}").format(
             s=sym, b=tot_buy, sl=tot_sell, p=tot_pl, sg="+" if tot_pl > 0 else "")
         tk.Label(win, text=info if self.history else "لا توجد عمليات بعد.",
-                 bg=BG, fg=TXT, font=("Segoe UI", 10, "bold")).pack(anchor="e", padx=14, pady=(0, 6))
+                 bg=BG, fg=TXT, font=("Segoe UI", 11, "bold")).pack(anchor="e",
+                                                                     padx=14, pady=(0, 6))
 
         def clear_hist():
             if self.history and messagebox.askyesno(
@@ -878,50 +3224,59 @@ class GoldApp:
                 self.history = []
                 self.save()
                 win.destroy()
-        bar = tk.Frame(win, bg=BG); bar.pack(fill="x", padx=12, pady=(0, 10))
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=12, pady=(0, 10))
         self._mkbtn(bar, "مسح السجل", clear_hist, kind="danger",
-                    font_size=9).pack(side="left")
+                    font_size=10).pack(side="left")
         self._mkbtn(bar, "إغلاق", win.destroy, kind="neutral",
-                    font_size=9).pack(side="left", padx=6)
+                    font_size=10).pack(side="left", padx=6)
 
-    # ---------- حاسبة الزكاة ----------
+    # ============================ حاسبة الزكاة ============================
     def open_zakat(self):
         t = self.theme
         BG, CARD = t["bg"], t["card"]
         GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
         sym = CUR[self.cur]["sym"]
-        NISAB_G = 85.0            # نصاب الذهب ≈ 85 غراماً
-        ZAKAT_RATE = 0.025       # 2.5%
+        NISAB_G = 85.0
+        ZAKAT_RATE = 0.025
         grams = self.total_open_grams()
-        gram_val_disp = self.gram_market_disp()   # سعر الغرام السوقي الحالي
-        total_val = grams * gram_val_disp
-        zakat_g = grams * ZAKAT_RATE
+        gram_val = self.gram_market_disp() * karat_factor(self.karat)
+        # القيمة حسب عيار كل عملية، والنصاب يُقاس بالغرام الصافي (مكافئ عيار 24)
+        oz_g = self.gram_market_disp()
+        total_val = 0.0
+        pure_g = 0.0
+        for h in self.holdings:
+            f = OZ_TO_G if h["unit"] == "oz" else 1
+            kf = karat_factor(h.get("karat", 24))
+            total_val += h["qty"] * f * oz_g * kf
+            pure_g += h["qty"] * f * kf
         zakat_val = total_val * ZAKAT_RATE
-        reached = grams >= NISAB_G
+        zakat_g = pure_g * ZAKAT_RATE
+        reached = pure_g >= NISAB_G
 
-        win = tk.Toplevel(self.root)
-        win.title("حاسبة الزكاة")
+        win = self._open_page("zakat", "حاسبة الزكاة")
         win.configure(bg=BG)
-        win.geometry("460x360")
+        win.geometry("470x380")
         win.transient(self.root)
-        tk.Label(win, text="📐 حاسبة زكاة الذهب", bg=BG, fg=GOLD,
-                 font=("Segoe UI", 13, "bold")).pack(anchor="e", padx=16, pady=(14, 8))
-
-        card = tk.Frame(win, bg=CARD); card.pack(fill="both", expand=True, padx=14, pady=8)
+        card = tk.Frame(win, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        card.pack(fill="both", expand=True, padx=6, pady=8)
 
         def row(label, value, color=None):
-            fr = tk.Frame(card, bg=CARD); fr.pack(fill="x", padx=14, pady=6)
-            tk.Label(fr, text=label, bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(side="right")
+            fr = tk.Frame(card, bg=CARD)
+            fr.pack(fill="x", padx=22, pady=11)
+            tk.Label(fr, text=label, bg=CARD, fg=MUT,
+                     font=("Segoe UI", 11)).pack(side="right")
             tk.Label(fr, text=value, bg=CARD, fg=color or TXT,
-                     font=("Segoe UI", 11, "bold")).pack(side="left")
+                     font=("Segoe UI", 12, "bold")).pack(side="left")
 
-        row("الرصيد المملوك:", "{:,.3f} غرام".format(grams))
-        row("سعر الغرام الحالي:", "{}{:,.2f}".format(sym, gram_val_disp))
+        row("الرصيد المملوك:", "{:,.3f} غرام (صافي {:,.3f} غ عيار 24)".format(
+            grams, pure_g))
+        row("سعر الغرام الحالي:", "{}{:,.2f}".format(sym, gram_val))
         row("القيمة الإجمالية:", "{}{:,.2f}".format(sym, total_val))
-        row("النصاب (85غ):",
-            "✔ بلغ النصاب" if reached else "✖ دون النصاب",
+        row("النصاب (85غ):", "✔ بلغ النصاب" if reached else "✖ دون النصاب",
             t.get("profit") if reached else t.get("loss"))
-        tk.Frame(card, bg=t.get("border", "#2a3240"), height=1).pack(fill="x", padx=14, pady=8)
+        tk.Frame(card, bg=t.get("border", "#252c39"), height=1).pack(fill="x", padx=22, pady=10)
         row("الزكاة الواجبة (2.5%):",
             "{}{:,.2f}".format(sym, zakat_val) if reached else "لا تجب",
             GOLD if reached else MUT)
@@ -929,402 +3284,372 @@ class GoldApp:
             row("أو ما يعادل:", "{:,.3f} غرام ذهب".format(zakat_g), GOLD)
 
         tk.Label(win, text="ملاحظة: تجب الزكاة بعد مرور الحول (سنة هجرية) على بلوغ النصاب.\n"
-                      "الحساب تقديري للاستئناس فقط.",
-                 bg=BG, fg=MUT, font=("Segoe UI", 8), justify="right").pack(anchor="e", padx=16, pady=(4, 10))
+                          "الحساب تقديري للاستئناس فقط.",
+                 bg=BG, fg=MUT, font=("Segoe UI", 11), justify="right",
+                 wraplength=520).pack(anchor="e", padx=24, pady=(8, 14))
 
-    # ---------- مخطط سعر الغرام خلال اليوم ----------
+    # ============================ مخطط سعر الغرام ============================
     def _record_price_sample(self, oz_usd):
-        """تسجيل عينة سعر (أونصة دولار) مع حذف ما تجاوز 24 ساعة."""
+        """يحفظ عينة سعر: كل العينات لآخر 24 ساعة، وعينة كل 5 دقائق لما قبلها حتى أسبوع."""
         try:
             now = time.time()
             self.price_hist.append([now, float(oz_usd)])
-            cutoff = now - 24 * 3600
-            self.price_hist = [p for p in self.price_hist if p[0] >= cutoff][-500:]
+            keep_from = now - 7 * 86400
+            day_ago = now - 86400
+            recent, older = [], []
+            for ts, oz in self.price_hist:
+                if ts < keep_from:
+                    continue
+                if ts >= day_ago:
+                    recent.append([ts, oz])
+                else:
+                    older.append([ts, oz])
+            # تخفيف الأقدم من 24 ساعة: عينة واحدة لكل 5 دقائق
+            thinned, bucket = [], None
+            for ts, oz in older:
+                b = int(ts // 300)
+                if b != bucket:
+                    thinned.append([ts, oz])
+                    bucket = b
+                else:
+                    thinned[-1] = [ts, oz]
+            self.price_hist = (thinned + recent)[-6000:]
         except Exception:
             pass
 
-    def open_chart(self):
+    # ============================ صفحة المخطط ============================
+    def _build_chart_page(self):
         t = self.theme
         BG, CARD = t["bg"], t["card"]
-        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
-        sym = CUR[self.cur]["sym"]
-        win = tk.Toplevel(self.root)
-        win.title("مخطط سعر الغرام - اليوم")
-        win.configure(bg=BG)
-        win.geometry("640x420")
-        win.transient(self.root)
-        tk.Label(win, text="📈 حركة سعر الغرام (السوقي) خلال اليوم", bg=BG, fg=GOLD,
-                 font=("Segoe UI", 12, "bold")).pack(anchor="e", padx=14, pady=(12, 4))
-        W, H = 600, 320
-        cv = tk.Canvas(win, width=W, height=H, bg=CARD, highlightthickness=0)
-        cv.pack(padx=14, pady=8)
+        GOLD, MUT = t["accent"], t["muted"]
+        px = self._px
+        head = tk.Frame(self.chart_page, bg=BG)
+        head.pack(fill="x", padx=px(24), pady=(px(14), px(8)))
+        tk.Label(head, text="📈 مخطط سعر الغرام", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 16, "bold")).pack(side="right")
+        self._mkbtn(head, "🏠 الرئيسية", lambda: self._show_page("main"),
+                    kind="ghost", font_size=10).pack(side="left")
+        tk.Label(head, text="يتحدّث تلقائياً مع كل تحديث للسعر",
+                 bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(side="left", padx=12)
+        tk.Frame(self.chart_page, bg=t.get("border", "#252c39"),
+                 height=1).pack(fill="x", padx=px(22))
 
-        # عينات اليوم الحالي فقط
-        today = datetime.now().strftime("%Y-%m-%d")
-        rate = self.rate()
-        pts = [(ts, (oz / OZ_TO_G) * rate) for ts, oz in self.price_hist
-               if datetime.fromtimestamp(ts).strftime("%Y-%m-%d") == today]
-        if len(pts) < 2:
-            cv.create_text(W // 2, H // 2,
-                           text="لا توجد بيانات كافية بعد.\nاترك البرنامج مفتوحاً لتجميع الأسعار.",
-                           fill=MUT, font=("Segoe UI", 11), justify="center")
-            self._mkbtn(win, "إغلاق", win.destroy, kind="neutral",
-                        font_size=9).pack(pady=6)
-            return
-        pl, pr, pt, pb = 64, 20, 20, 40    # هوامش
-        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        xmin, xmax = min(xs), max(xs)
-        ymin, ymax = min(ys), max(ys)
-        if ymax - ymin < 1e-9:
-            ymin -= 1; ymax += 1
-        pad = (ymax - ymin) * 0.1
-        ymin -= pad; ymax += pad
+        rng = tk.Frame(self.chart_page, bg=BG)
+        rng.pack(fill="x", padx=px(24), pady=(px(10), 0))
+        tk.Label(rng, text="النطاق الزمني:", bg=BG, fg=MUT,
+                 font=("Segoe UI", 10)).pack(side="right", padx=(8, 6))
+        self._range_btns = {}
+        for key, label, _secs in CHART_RANGES:
+            b = tk.Label(rng, text=label, bg=t.get("card2", CARD), fg=MUT,
+                         padx=18, pady=4, cursor="hand2",
+                         highlightthickness=1,
+                         highlightbackground=t.get("border", "#252c39"),
+                         font=("Segoe UI", 11, "bold"))
+            b.pack(side="right", padx=4)
+            b.bind("<Button-1>", lambda e, k=key: self._set_chart_range(k))
+            self._range_btns[key] = b
 
-        def X(x):
-            return pl + (x - xmin) / (xmax - xmin) * (W - pl - pr) if xmax > xmin else pl
+        self.chart_info = tk.Label(self.chart_page, text="", bg=BG, fg=MUT,
+                                   font=("Segoe UI", 11, "bold"))
+        self.chart_info.pack(anchor="e", padx=26, pady=(10, 4))
+        self._paint_range_buttons()
 
-        def Y(y):
-            return pt + (ymax - y) / (ymax - ymin) * (H - pt - pb)
+        wrap = tk.Frame(self.chart_page, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        wrap.pack(fill="both", expand=True, padx=20, pady=(4, 14))
+        self.chart_canvas = tk.Canvas(wrap, bg=CARD, highlightthickness=0)
+        self.chart_canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        self.chart_canvas.bind("<Configure>", lambda e: self.draw_chart())
 
-        # شبكة + محاور أفقية
-        for i in range(5):
-            yy = ymin + (ymax - ymin) * i / 4
-            y = Y(yy)
-            cv.create_line(pl, y, W - pr, y, fill=t.get("border", "#2a3240"))
-            cv.create_text(pl - 6, y, text="{:,.1f}".format(yy), fill=MUT,
-                           anchor="e", font=("Segoe UI", 8))
-        # تسميات زمنية (بداية/نهاية)
-        cv.create_text(pl, H - pb + 14,
-                       text=datetime.fromtimestamp(xmin).strftime("%H:%M"),
-                       fill=MUT, anchor="w", font=("Segoe UI", 8))
-        cv.create_text(W - pr, H - pb + 14,
-                       text=datetime.fromtimestamp(xmax).strftime("%H:%M"),
-                       fill=MUT, anchor="e", font=("Segoe UI", 8))
-        # الخط
-        coords = []
-        for x, y in pts:
-            coords += [X(x), Y(y)]
-        up = ys[-1] >= ys[0]
-        line_col = t.get("profit", "#2ecc71") if up else t.get("loss", "#ff5c5c")
-        cv.create_line(*coords, fill=line_col, width=2, smooth=True)
-        # نقطة النهاية
-        cv.create_oval(X(xs[-1]) - 4, Y(ys[-1]) - 4, X(xs[-1]) + 4, Y(ys[-1]) + 4,
-                       fill=line_col, outline="")
-        change = ys[-1] - ys[0]
-        pct = (change / ys[0] * 100) if ys[0] else 0
-        tk.Label(win,
-                 text="الافتتاح: {s}{o:,.2f}   •   الآن: {s}{c:,.2f}   •   التغيّر: {sg}{s}{d:,.2f} ({sg}{p:.2f}%)".format(
-                     s=sym, o=ys[0], c=ys[-1], d=change, p=pct,
-                     sg="+" if change > 0 else ""),
-                 bg=BG, fg=line_col, font=("Segoe UI", 10, "bold")).pack(anchor="e", padx=14, pady=4)
-        self._mkbtn(win, "إغلاق", win.destroy, kind="neutral",
-                    font_size=9).pack(pady=6)
+    # ------------------------- التنقل بين الصفحات -------------------------
+    def _all_pages(self):
+        pages = {"main": getattr(self, "main_wrap", None),
+                 "chart": getattr(self, "chart_page", None)}
+        for key, info in getattr(self, "_pages", {}).items():
+            pages[key] = info["container"]
+        return pages
 
-    # ---------- التنبيهات ----------
-    def add_alert(self):
-        if not getattr(self, "al_price", None):
-            return
-        try:
-            price = float(self.al_price.get())
-        except ValueError:
-            messagebox.showwarning("تنبيه", "الرجاء إدخال سعر صحيح للتنبيه")
-            return
-        if price <= 0:
-            messagebox.showwarning("تنبيه", "السعر يجب أن يكون أكبر من صفر")
-            return
-        self.alerts.append({
-            "metric": self.al_metric.get(),
-            "op": self.al_op.get(),
-            "price": price,
-            "cur": self.cur,
-            "triggered": False,
-        })
-        self.al_price.delete(0, "end")
-        self.save()
-        self.refresh_alert_list()
-
-    def del_alert(self):
-        if not getattr(self, "al_list", None):
-            return
-        sel = self.al_list.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        if 0 <= idx < len(self.alerts):
-            del self.alerts[idx]
-            self.save()
-            self.refresh_alert_list()
-
-    def refresh_alert_list(self):
-        if not getattr(self, "al_list", None):
-            return
-        try:
-            self.al_list.delete(0, "end")
-            for a in self.alerts:
-                unit = "أونصة" if a["metric"] == "oz" else "غرام"
-                state = " ✔ تم التنبيه" if a.get("triggered") else ""
-                self.al_list.insert("end", "عندما يصبح سعر ال{u} {op} {p:,.2f} {c}{s}".format(
-                    u=unit, op=a["op"], p=a["price"], c=CUR[a["cur"]]["name"], s=state))
-        except Exception:
-            pass
-
-    def eff_price_in_cur(self, metric, ccy):
-        """السعر الفعلي للوحدة بعملة محددة (بعد طرح المبلغ)."""
-        gram = (self.spot_oz_usd / OZ_TO_G) * self.rates.get(ccy, 1.0) - self.adjust
-        return gram * OZ_TO_G if metric == "oz" else gram
-
-    def check_alerts(self):
-        if not self.spot_oz_usd:
-            return
-        fired = []
-        changed = False
-        for a in self.alerts:
-            cur_val = self.eff_price_in_cur(a["metric"], a["cur"])
-            hit = (cur_val >= a["price"]) if a["op"] == ">=" else (cur_val <= a["price"])
-            if hit and not a.get("triggered"):
-                a["triggered"] = True
-                changed = True
-                unit = "الأونصة" if a["metric"] == "oz" else "الغرام"
-                fired.append("سعر {u} وصل {op} {p:,.2f} {c}\nالسعر الحالي: {v:,.2f} {c}".format(
-                    u=unit, op=a["op"], p=a["price"], v=cur_val, c=CUR[a["cur"]]["name"]))
-            elif not hit and a.get("triggered"):
-                a["triggered"] = False   # إعادة التسليح عند زوال الشرط
-                changed = True
-        if fired:
-            self._play_sound()
-            messagebox.showinfo("🔔 تنبيه سعر الذهب", "\n\n".join(fired))
-        if changed:
-            self.save()
-            self.refresh_alert_list()
-
-    def _play_sound(self):
-        if not self.sound_on:
-            return
-        threading.Thread(target=self._sound_worker, daemon=True).start()
-
-    def _test_sound(self):
-        threading.Thread(target=self._sound_worker, daemon=True).start()
-
-    def _sound_worker(self):
-        try:
-            import winsound
-            # نغمة تنبيه واضحة متكررة
-            for _ in range(3):
-                winsound.Beep(1046, 220)   # دو
-                winsound.Beep(1318, 220)   # مي
-                winsound.Beep(1568, 320)   # صول
-        except Exception:
+    def _show_page(self, name):
+        """التبديل بين الرئيسية والمخطط وأي صفحة داخلية أخرى بنفس النافذة."""
+        pages = self._all_pages()
+        if name not in pages or pages[name] is None:
+            name = "main"
+        self._page = name
+        for page in pages.values():
+            if page is not None and page.winfo_manager():
+                page.pack_forget()
+        pages[name].pack(fill="both", expand=True)
+        # إعادة أي صفحة إلى أعلاها عند فتحها (لا يظهر منتصفها)
+        info = getattr(self, "_pages", {}).get(name) or {}
+        scroller = info.get("scroll")
+        if name == "main":
+            scroller = getattr(self, "main_wrap", None)
+        if scroller is not None:
             try:
-                for _ in range(5):
-                    self.root.bell()
-                    self.root.after(150)
+                scroller.refresh()
+                scroller.to_top()
+            except Exception:
+                pass
+        if name == "chart":
+            self.root.after(30, self.draw_chart)
+
+    def _open_page(self, key, title):
+        """ينشئ (أو يعيد إنشاء) صفحة داخلية ويظهرها، ويعيد إطار المحتوى."""
+        t = self.theme
+        BG = t["bg"]
+        if key in getattr(self, "_pages", {}):
+            self._close_page(key)
+        container = tk.Frame(self.page_holder, bg=BG)
+        px = self._px
+        header = tk.Frame(container, bg=BG)
+        header.pack(fill="x", padx=px(24), pady=(px(16), px(8)))
+        title_lbl = tk.Label(header, text=title, bg=BG, fg=t["accent"],
+                             font=("Segoe UI", 18, "bold"))
+        title_lbl.pack(side="right")
+        # محتوى الصفحة داخل منطقة تمرير حتى لا يُقصّ أي جزء على الشاشات الصغيرة
+        scroll = ScrollArea(container, BG)
+        body = PageBody(scroll.inner, self, key, title_lbl)
+        self._mkbtn(header, "🏠 الرئيسية", lambda b=body: b.go_back(),
+                    kind="ghost", font_size=10).pack(side="left")
+        # خط فاصل رقيق أسفل شريط عنوان الصفحة
+        tk.Frame(container, bg=t.get("border", "#252c39"),
+                 height=1).pack(fill="x", padx=px(22))
+        # شريط سفلي بزر رجوع واضح (يُحجز قبل المحتوى حتى لا يُزاحم)
+        foot = tk.Frame(container, bg=BG)
+        foot.pack(side="bottom", fill="x", padx=px(24), pady=(px(6), px(12)))
+        self._mkbtn(foot, "←  رجوع إلى الرئيسية",
+                    lambda b=body: b.go_back(), kind="neutral",
+                    font_size=10).pack(anchor="center")
+        scroll.pack(fill="both", expand=True, padx=px(8), pady=(px(4), px(2)))
+        body.pack(fill="both", expand=True, padx=px(18), pady=(px(10), px(16)))
+        maxw = {"zakat": 700, "alerts": 820, "settings": 780,
+                "sell": 880, "account": 700, "history": 1400,
+                "calc": 900}.get(key, 1040)
+
+        def _fit(event=None, b=body, m=maxw):
+            # توسيط المحتوى بعرض مريح داخل نافذة عريضة بدل شده على الطول
+            try:
+                avail = b.master.winfo_width()
+                if avail < 80:
+                    return
+                side = max(0, int((avail - m) / 2))
+                edge = px(18)
+                b.pack_configure(padx=(edge + side, edge + side))
             except Exception:
                 pass
 
-    def on_sound_toggle(self):
-        self.sound_on = bool(self.sound_var.get())
-        self.save()
+        scroll.canvas.bind("<Configure>", _fit, add="+")
+        self.root.after(80, _fit)
+        self._pages[key] = {"container": container, "header": header,
+                            "body": body, "scroll": scroll}
+        self._show_page(key)
+        return body
 
-    def start_live_refresh(self):
-        """تحديث مستمر (شبه لحظي) لسعر السوق."""
-        self._live = True
-        self._ticks = 0          # عدد التحديثات الناجحة
-        self._fails = 0          # فشل متتالٍ
-        self._fx_last = 0.0      # آخر وقت جلب سعر الصرف
-        threading.Thread(target=self._live_worker, daemon=True).start()
-
-    def _live_worker(self):
-        while getattr(self, "_live", True):
-            try:
-                self._fetch_once()
-            except Exception:
-                pass   # لا نسمح لأي خطأ بإيقاف حلقة التحديث
-            # أقصر مدة آمنة لا تسبب حظراً
-            time.sleep(5)
-
-    # ---------- الإعدادات والألوان ----------
-    def rebuild_ui(self):
-        for w in self.root.winfo_children():
-            w.destroy()
-        self.build_ui()
-        self.update_price_labels()
-        self.render()
-
-    def open_settings(self):
-        from tkinter import colorchooser
-        t = self.theme
-        win = tk.Toplevel(self.root)
-        win.title("الإعدادات والألوان")
-        win.configure(bg=t["bg"])
-        win.geometry("460x640")
-        win.transient(self.root)
-        PAD = {"padx": 10, "pady": 5}
-
-        # ===== مصدر السعر =====
-        tk.Label(win, text="مصدر السعر", bg=t["bg"], fg=t["accent"],
-                 font=("Segoe UI", 12, "bold")).pack(anchor="e", **PAD)
-        src_disp = {"auto": "تلقائي (موصى به — يجرّب المصادر بالترتيب)"}
-        for _k in AUTO_ORDER:
-            src_disp[_k] = SOURCES[_k][0]
-        src_rev = {v: k for k, v in src_disp.items()}
-        cur_src_disp = src_disp.get(self.source_mode, src_disp["auto"])
-        srcfr = tk.Frame(win, bg=t["bg"]); srcfr.pack(fill="x", **PAD)
-        tk.Label(srcfr, text="المصدر", bg=t["bg"], fg=t["text"], width=10,
-                 anchor="e").pack(side="right")
-        src_var = tk.StringVar(value=cur_src_disp)
-        ttk.OptionMenu(srcfr, src_var, cur_src_disp,
-                       *src_disp.values()).pack(side="right", fill="x",
-                                                expand=True, padx=6)
-        tk.Label(win, text="اختر مصدراً محدداً للسعر أو دعه تلقائياً. يظهر المصدر الفعّال بسطر الحالة.",
-                 bg=t["bg"], fg=t["muted"], font=("Segoe UI", 8),
-                 wraplength=420, justify="right").pack(anchor="e", padx=10)
-
-        tk.Label(win, text="العناوين", bg=t["bg"], fg=t["accent"],
-                 font=("Segoe UI", 12, "bold")).pack(anchor="e", **PAD)
-        tvars = {}
-        for key, lbl in (("title", "العنوان الرئيسي"),
-                         ("subtitle", "العنوان الفرعي"),
-                         ("window", "عنوان النافذة")):
-            fr = tk.Frame(win, bg=t["bg"]); fr.pack(fill="x", **PAD)
-            tk.Label(fr, text=lbl, bg=t["bg"], fg=t["text"], width=14,
-                     anchor="e").pack(side="right")
-            v = tk.StringVar(value=self.titles.get(key, ""))
-            tk.Entry(fr, textvariable=v).pack(side="right", fill="x", expand=True, padx=6)
-            tvars[key] = v
-
-        tk.Label(win, text="الألوان", bg=t["bg"], fg=t["accent"],
-                 font=("Segoe UI", 12, "bold")).pack(anchor="e", **PAD)
-        color_fields = [
-            ("bg", "خلفية التطبيق"), ("card", "البطاقات"),
-            ("accent", "اللون المميز"), ("text", "لون النص"),
-            ("profit", "لون الربح"), ("loss", "لون الخسارة"),
-            ("total", "لون سطر الإجمالي"),
-        ]
-        swatches = {}
-        tmp = dict(self.theme)
-
-        def make_picker(k, swatch):
-            def pick():
-                c = colorchooser.askcolor(color=tmp.get(k), title="اختر لوناً", parent=win)
-                if c and c[1]:
-                    tmp[k] = c[1]
-                    swatch.config(bg=c[1])
-            return pick
-
-        for key, lbl in color_fields:
-            fr = tk.Frame(win, bg=t["bg"]); fr.pack(fill="x", **PAD)
-            tk.Label(fr, text=lbl, bg=t["bg"], fg=t["text"], width=16,
-                     anchor="e").pack(side="right")
-            sw = tk.Label(fr, text="      ", bg=tmp.get(key, "#000"),
-                          relief="solid", bd=1)
-            sw.pack(side="right", padx=6)
-            tk.Button(fr, text="اختيار لون", relief="flat",
-                      command=make_picker(key, sw)).pack(side="right")
-            swatches[key] = sw
-
-        btnfr = tk.Frame(win, bg=t["bg"]); btnfr.pack(fill="x", pady=16)
-
-        def do_save():
-            for k, v in tvars.items():
-                self.titles[k] = v.get().strip() or DEFAULT_TITLES.get(k, "")
-            self.theme.update(tmp)
-            self.source_mode = src_rev.get(src_var.get(), "auto")
-            self.save()
-            win.destroy()
-            self.rebuild_ui()
-
-        def do_reset():
-            self.theme = dict(DEFAULT_THEME)
-            self.titles = dict(DEFAULT_TITLES)
-            self.source_mode = "auto"
-            self.save()
-            win.destroy()
-            self.rebuild_ui()
-
-        tk.Button(btnfr, text="حفظ وتطبيق", command=do_save, bg=t["accent"],
-                  fg=t["accent_text"], relief="flat",
-                  font=("Segoe UI", 10, "bold")).pack(side="right", padx=10)
-        tk.Button(btnfr, text="استعادة الافتراضي", command=do_reset, bg="#444",
-                  fg="white", relief="flat").pack(side="right")
-
-    # ---------- تصدير Excel ----------
-    def export_excel(self):
-        from tkinter import filedialog
-        if not self.holdings and not self.sells:
-            messagebox.showinfo("تصدير Excel", "لا توجد عمليات لتصديرها.")
+    def _close_page(self, key):
+        """يغلق صفحة داخلية ويعود للصفحة الرئيسية."""
+        info = getattr(self, "_pages", {}).pop(key, None)
+        if info is None:
+            self._show_page("main")
             return
-        default = "محفظة_الذهب_{}.xlsx".format(datetime.now().strftime("%Y%m%d_%H%M"))
-        path = filedialog.asksaveasfilename(
-            title="حفظ ملف Excel", defaultextension=".xlsx",
-            initialfile=default,
-            filetypes=[("Excel", "*.xlsx")])
-        if not path:
-            return
-        ccy = CUR[self.cur]["name"]
-        headers = ["الاسم", "الحالة", "الكمية", "الوحدة",
-                   "سعر الشراء/وحدة ({})".format(ccy),
-                   "التكلفة ({})".format(ccy),
-                   "السعر الحالي/البيع ({})".format(ccy),
-                   "القيمة ({})".format(ccy),
-                   "الربح/الخسارة ({})".format(ccy), "النسبة %"]
-        rows = []
-        t_cost = t_val = 0.0
-        t_qty_g = 0.0
-        realized = 0.0
-        # المراكز المفتوحة (الرصيد المتبقي)
-        for h in self.holdings:
-            unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
-            cost_disp = h["qty"] * h["buy"] * self.rate()
-            cur_disp = self.current_per_unit_disp(h["unit"])
-            value_disp = h["qty"] * cur_disp
-            pl = value_disp - cost_disp
-            pct = (pl / cost_disp * 100) if cost_disp else 0
-            t_cost += cost_disp
-            t_val += value_disp
-            t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
-            rows.append([
-                h["name"], "مفتوح", round(h["qty"], 6), unit_txt,
-                round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
-                round(cur_disp, 3), round(value_disp, 3),
-                round(pl, 3), round(pct, 2),
-            ])
-        # عمليات البيع المحققة
-        for s in self.sells:
-            qty_g = s["qty_g"]
-            cost_disp = s["cost"] * self.rate()
-            sell_disp = s["sell"] * self.rate()
-            value_disp = qty_g * sell_disp
-            pl = value_disp - cost_disp
-            pct = (pl / cost_disp * 100) if cost_disp else 0
-            realized += pl
-            buy_per_g_disp = (cost_disp / qty_g) if qty_g else 0.0
-            rows.append([
-                "{} ({})".format(s.get("name", "بيع ذهب"), s.get("date", "")),
-                "مباع", round(qty_g, 6), "غرام",
-                round(buy_per_g_disp, 3), round(cost_disp, 3),
-                round(sell_disp, 3), round(value_disp, 3),
-                round(pl, 3), round(pct, 2),
-            ])
-        t_pl = t_val - t_cost
-        t_pct = (t_pl / t_cost * 100) if t_cost else 0
-        rows.append(["∑ الرصيد المتبقي (غير محقق)", "", round(t_qty_g, 3), "غرام",
-                     "", round(t_cost, 3), "", round(t_val, 3),
-                     round(t_pl, 3), round(t_pct, 2)])
-        rows.append(["∑ الربح المحقق (المباع)", "", "", "",
-                     "", "", "", "", round(realized, 3), ""])
-        rows.append(["∑ الإجمالي (محقق + غير محقق)", "", "", "",
-                     "", "", "", "", round(t_pl + realized, 3), ""])
+        self._closing_page = True
         try:
-            write_xlsx(path, headers, rows)
-        except Exception as e:
-            messagebox.showerror("تصدير Excel", "تعذّر حفظ الملف:\n{}".format(e))
-            return
-        messagebox.showinfo("تصدير Excel",
-                            "تم تصدير {} سجل بنجاح.".format(len(self.holdings) + len(self.sells)))
+            info["container"].destroy()
+        except Exception:
+            pass
+        finally:
+            self._closing_page = False
+        if key == "alerts":
+            self.al_win = None
+            self.al_list = None
+            self.al_price = None
+            self.al_cur_lbl = None
+            self.al_metric = None
+            self.al_op = None
+        if getattr(self, "_page", "main") == key:
+            self._show_page("main")
 
-    # ---------- نافذة تنبيه السعر (مستقلة) ----------
+    def _goto_back(self, win):
+        """زر الرجوع أعلى الصفحات الداخلية."""
+        try:
+            win.go_back()
+        except Exception:
+            self._close_page(getattr(win, "page_key", ""))
+
+    def rebuild_ui(self):
+        try:
+            self._close_chooser()
+        except Exception:
+            pass
+        self._closing_page = True
+        self._pages = {}
+        was_widget = getattr(self, "price_widget", None) is not None
+        self.price_widget = None
+        try:
+            for w in list(self.root.winfo_children()):
+                w.destroy()
+        finally:
+            self._closing_page = False
+        self._page = "main"
+        self.build_ui()
+        self.render()
+        if was_widget and getattr(self, "user", None):
+            self.open_widget()
+
+    def show_chart(self):
+        self._show_page("chart")
+
+    def _set_chart_range(self, key):
+        if key not in ("hour", "day", "week") or key == self.chart_range:
+            return
+        self.chart_range = key
+        self.save()
+        self._paint_range_buttons()
+        self.draw_chart()
+
+    def _paint_range_buttons(self):
+        """تلوين زر النطاق النشط."""
+        t = self.theme
+        for key, btn in getattr(self, "_range_btns", {}).items():
+            active = (key == self.chart_range)
+            try:
+                btn.config(bg=t["accent"] if active else t.get("card2", t["card"]),
+                           fg=t.get("accent_text", "#000") if active else t["muted"])
+            except Exception:
+                pass
+
+    def _range_seconds(self):
+        for key, _label, secs in CHART_RANGES:
+            if key == self.chart_range:
+                return secs
+        return 86400
+
+    def _range_label(self):
+        for key, label, _secs in CHART_RANGES:
+            if key == self.chart_range:
+                return label
+        return "يوم"
+
+    def _chart_points(self):
+        """نقاط النطاق المختار (وقت، سعر الغرام) بعيار وعملة العرض الحاليين."""
+        now = time.time()
+        cutoff = now - self._range_seconds()
+        rate = self.rate()
+        kf = karat_factor(self.karat)
+        pts = [(ts, (oz / OZ_TO_G) * rate * kf) for ts, oz in self.price_hist
+               if ts >= cutoff]
+        # تخفيف نقاط الرسم للنطاقات الطويلة (مع الإبقاء على أول وآخر نقطة)
+        if len(pts) > 500:
+            step = len(pts) // 500 + 1
+            pts = pts[::step] + [pts[-1]]
+        return pts
+
+    def _fmt_tick(self, ts):
+        d = datetime.fromtimestamp(ts)
+        if self.chart_range == "week":
+            return d.strftime("%m-%d\n%H:%M")
+        return d.strftime("%H:%M")
+
+    def draw_chart(self):
+        """يرسم المخطط على صفحة المخطط (يُستدعى عند العرض وعند كل تحديث سعر)."""
+        cv = getattr(self, "chart_canvas", None)
+        if cv is None:
+            return
+        t = self.theme
+        CARD = t["card"]
+        GOLD, MUT = t["accent"], t["muted"]
+        sym = CUR[self.cur]["sym"]
+        try:
+            cv.delete("all")
+            W = cv.winfo_width() or 900
+            H = cv.winfo_height() or 430
+            if W < 260:
+                W = 900
+            if H < 180:
+                H = 430
+            pts = self._chart_points()
+            if len(pts) < 2:
+                cv.create_text(W // 2, H // 2,
+                               text=("لا توجد بيانات كافية في نطاق «{}».\n"
+                                     "اترك البرنامج مفتوحاً ليجمّع الأسعار تلقائياً.").format(
+                                         self._range_label()),
+                               fill=MUT, font=("Segoe UI", 12), justify="center")
+                pf = getattr(self, "chart_info", None)
+                if pf is not None:
+                    pf.config(text="عدد العينات في هذا النطاق: {}".format(len(pts)), fg=MUT)
+                return
+            pl, pr, pt, pb = 82, 26, 26, 46
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            if ymax - ymin < 1e-9:
+                ymin -= 1
+                ymax += 1
+            pad = (ymax - ymin) * 0.1
+            ymin -= pad
+            ymax += pad
+
+            def X(x):
+                return (pl + (x - xmin) / (xmax - xmin) * (W - pl - pr)
+                        if xmax > xmin else pl)
+
+            def Y(y):
+                return pt + (ymax - y) / (ymax - ymin) * (H - pt - pb)
+
+            for i in range(5):
+                yy = ymin + (ymax - ymin) * i / 4
+                y = Y(yy)
+                cv.create_line(pl, y, W - pr, y, fill=t.get("border", "#252c39"))
+                cv.create_text(pl - 8, y, text="{:,.1f}".format(yy), fill=MUT,
+                               anchor="e", font=("Segoe UI", 10))
+            # علامات زمنية على المحور الأفقي
+            fracs = [0.0, 0.5, 1.0] if self.chart_range == "hour" \
+                else [0.0, 0.25, 0.5, 0.75, 1.0]
+            for frac in fracs:
+                if frac == 0.0:
+                    anchor = "w"
+                elif frac == 1.0:
+                    anchor = "e"
+                else:
+                    anchor = "center"
+                ts = xmin + (xmax - xmin) * frac
+                x = pl + (W - pl - pr) * frac
+                cv.create_text(x, H - pb + 16, text=self._fmt_tick(ts), fill=MUT,
+                               anchor=anchor, font=("Segoe UI", 11),
+                               justify="center")
+            cv.create_text(W - pr, pt - 10, text="({})".format(sym), fill=MUT,
+                           anchor="e", font=("Segoe UI", 10))
+
+            coords = []
+            for x, y in pts:
+                coords += [X(x), Y(y)]
+            up = ys[-1] >= ys[0]
+            line_col = t.get("profit", "#2ecc71") if up else t.get("loss", "#ff5c5c")
+            cv.create_line(*coords, fill=line_col, width=2, smooth=True)
+            cv.create_oval(X(xs[-1]) - 4, Y(ys[-1]) - 4,
+                           X(xs[-1]) + 4, Y(ys[-1]) + 4,
+                           fill=line_col, outline="")
+
+            change = ys[-1] - ys[0]
+            pct = (change / ys[0] * 100) if ys[0] else 0
+            info = ("{rg}  •  عيار {k}  •  الافتتاح: {s}{o:,.2f}  •  الآن: {s}{c:,.2f}  •  "
+                    "التغيّر: {s}{sg}{d:,.2f} ({sg}{p:.2f}%)  •  آخر تحديث: {u}").format(
+                rg=self._range_label(), k=self.karat, s=sym, o=ys[0], c=ys[-1],
+                d=change, p=pct, sg="+" if change > 0 else "",
+                u=self.last_update or "--:--:--")
+            lbl = getattr(self, "chart_info", None)
+            if lbl is not None:
+                lbl.config(text=info, fg=line_col)
+        except Exception:
+            pass
+
+    def _refresh_chart_if_visible(self):
+        if getattr(self, "_page", "main") == "chart":
+            self.draw_chart()
+
+    # ============================ التنبيهات ============================
     def open_alerts(self):
-        if getattr(self, "al_win", None) is not None:
+        if self.al_win is not None:
             try:
                 self.al_win.deiconify()
                 self.al_win.lift()
@@ -1334,51 +3659,59 @@ class GoldApp:
         t = self.theme
         BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
         GOLD, ATXT, TXT, MUT = t["accent"], t["accent_text"], t["text"], t["muted"]
-        win = tk.Toplevel(self.root)
+        win = self._open_page("alerts", "تنبيهات الأسعار")
         self.al_win = win
-        win.title("إضافة تنبيه السعر")
         win.configure(bg=BG)
-        win.geometry("540x360")
+        win.geometry("560x380")
         win.transient(self.root)
 
-        al = tk.LabelFrame(win, text="🔔 تنبيهات الأسعار", bg=CARD, fg=GOLD,
-                           font=("Segoe UI", 10, "bold"))
-        al.pack(fill="both", expand=True, padx=12, pady=12)
+        al = tk.LabelFrame(win, text="  ➕ إضافة تنبيه جديد  ", bg=CARD, fg=GOLD,
+                           font=("Segoe UI", 11, "bold"), bd=0,
+                           highlightthickness=1,
+                           highlightbackground=t.get("border", "#252c39"))
+        al.pack(fill="both", expand=True, padx=4, pady=8)
 
         row = tk.Frame(al, bg=CARD)
-        row.pack(fill="x", padx=6, pady=6)
-        tk.Label(row, text="نبّهني عندما يصبح سعر", bg=CARD, fg=TXT).pack(side="right")
+        row.pack(fill="x", padx=14, pady=11)
+        tk.Label(row, text="نبّهني عندما يصبح سعر", bg=CARD, fg=TXT,
+                 font=("Segoe UI", 10)).pack(side="right")
         self.al_metric = tk.StringVar(value="g")
         ttk.OptionMenu(row, self.al_metric, "g", "g", "oz").pack(side="right", padx=4)
         self.al_op = tk.StringVar(value=">=")
         ttk.OptionMenu(row, self.al_op, ">=", ">=", "<=").pack(side="right", padx=4)
-        self.al_price = tk.Entry(row, width=10)
-        self.al_price.pack(side="right", padx=4)
-        self.al_cur_lbl = tk.Label(row, text="(" + CUR[self.cur]["name"] + ")", bg=CARD, fg=MUT)
+        self.al_price = self._mkentry(row, tk.StringVar(), width=10)
+        self.al_price.pack(side="right", padx=6, ipady=4)
+        self.al_cur_lbl = tk.Label(row, text="(" + CUR[self.cur]["name"] + ")",
+                                   bg=CARD, fg=MUT, font=("Segoe UI", 10))
         self.al_cur_lbl.pack(side="right")
-        tk.Button(row, text="إضافة تنبيه", command=self.add_alert, bg=GOLD,
-                  fg=ATXT, relief="flat", font=("Segoe UI", 9, "bold")).pack(side="right", padx=8)
+        self._mkbtn(row, "＋ إضافة", self.add_alert, kind="primary",
+                    font_size=10).pack(side="right", padx=10)
         tk.Label(al, text="(السعر = سعر الراجحي للبيع بعد الطرح / بالوحدة المختارة)",
-                 bg=CARD, fg=MUT, font=("Segoe UI", 8)).pack(anchor="e", padx=10)
+                 bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(anchor="e", padx=16)
 
         row2 = tk.Frame(al, bg=CARD)
-        row2.pack(fill="both", expand=True, padx=6, pady=6)
-        self.al_list = tk.Listbox(row2, height=6, bg=CARD2, fg=TXT,
-                                  selectbackground="#33415c", relief="flat",
-                                  font=("Segoe UI", 9))
+        row2.pack(fill="both", expand=True, padx=14, pady=(4, 12))
+        self.al_list = tk.Listbox(row2, height=7, bg=CARD2, fg=TXT,
+                                  selectbackground=t.get("border", "#2c3a52"),
+                                  selectforeground="#ffffff", relief="flat",
+                                  bd=0, highlightthickness=1,
+                                  highlightbackground=t.get("border", "#252c39"),
+                                  font=("Segoe UI", 10))
         self.al_list.pack(side="left", fill="both", expand=True)
-        tk.Button(row2, text="حذف التنبيه", command=self.del_alert, bg=t["loss"],
-                  fg="white", relief="flat").pack(side="left", padx=6)
+        self._mkbtn(row2, "🗑 حذف", self.del_alert, kind="danger",
+                    font_size=10).pack(side="left", padx=(8, 2))
 
         row3 = tk.Frame(al, bg=CARD)
-        row3.pack(fill="x", padx=6, pady=6)
+        row3.pack(fill="x", padx=14, pady=(2, 10))
         self.sound_var = tk.BooleanVar(value=self.sound_on)
         tk.Checkbutton(row3, text="تفعيل التنبيه الصوتي 🔊", variable=self.sound_var,
                        command=self.on_sound_toggle, bg=CARD, fg=TXT,
-                       selectcolor=CARD2, activebackground=CARD,
-                       activeforeground=TXT).pack(side="right")
-        tk.Button(row3, text="تجربة الصوت", command=self._test_sound, bg=CARD2,
-                  fg=GOLD, relief="flat").pack(side="right", padx=8)
+                       selectcolor=t.get("entry_bg", "#151a23"),
+                       activebackground=CARD, activeforeground=TXT,
+                       bd=0, highlightthickness=0,
+                       font=("Segoe UI", 10)).pack(side="right")
+        self._mkbtn(row3, "🔊 تجربة", self._test_sound, kind="ghost",
+                    font_size=10).pack(side="right", padx=10)
 
         def on_close():
             self.al_win = None
@@ -1391,14 +3724,445 @@ class GoldApp:
         win.protocol("WM_DELETE_WINDOW", on_close)
         self.refresh_alert_list()
 
-    # ---------- جلب البيانات ----------
+    def add_alert(self):
+        if not getattr(self, "al_price", None):
+            return
+        try:
+            price = float(self.al_price.get())
+        except ValueError:
+            messagebox.showwarning("تنبيه", "الرجاء إدخال سعر صحيح للتنبيه")
+            return
+        if price <= 0:
+            messagebox.showwarning("تنبيه", "السعر يجب أن يكون أكبر من صفر")
+            return
+        self.alerts.append({"metric": self.al_metric.get(),
+                            "op": self.al_op.get(), "price": price,
+                            "cur": self.cur, "fired": False})
+        self.save()
+        self.refresh_alert_list()
+        if getattr(self, "al_price", None):
+            self.al_price.delete(0, "end")
+
+    def del_alert(self):
+        if not getattr(self, "al_list", None):
+            return
+        s = self.al_list.curselection()
+        if not s:
+            return
+        idx = s[0]
+        if 0 <= idx < len(self.alerts):
+            del self.alerts[idx]
+            self.save()
+            self.refresh_alert_list()
+
+    def refresh_alert_list(self):
+        if not getattr(self, "al_list", None):
+            return
+        self.al_list.delete(0, "end")
+        for a in self.alerts:
+            unit = "غرام" if a["metric"] == "g" else "أونصة"
+            self.al_list.insert("end", "{} {} {}{:,.2f} ({})".format(
+                unit, a["op"], CUR.get(a.get("cur", "USD"), {}).get("sym", ""),
+                a["price"], "✔" if a.get("fired") else "…"))
+
+    def on_sound_toggle(self):
+        self.sound_on = bool(self.sound_var.get())
+        self.save()
+
+    def _test_sound(self):
+        self._beep()
+
+    def _beep(self):
+        if not self.sound_on:
+            return
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            try:
+                self.root.bell()
+            except Exception:
+                pass
+
+    def check_alerts(self):
+        if not self.spot_oz_usd:
+            return
+        changed = False
+        fired_msgs = []
+        for a in self.alerts:
+            ccy = a.get("cur", self.cur)
+            gram = (self.spot_oz_usd / OZ_TO_G) * self.rates.get(ccy, 1.0)
+            if ccy == "SAR":
+                gram -= self.adjust
+            val = gram * OZ_TO_G if a["metric"] == "oz" else gram
+            ok = (val >= a["price"]) if a["op"] == ">=" else (val <= a["price"])
+            if ok and not a.get("fired"):
+                a["fired"] = True
+                changed = True
+                self._beep()
+                unit = "غرام" if a["metric"] == "g" else "أونصة"
+                sym = CUR.get(ccy, {}).get("sym", "")
+                sign = "≥" if a["op"] == ">=" else "≤"
+                fired_msgs.append("{} الذهب {} {:.2f} — الآن {:.2f} {}".format(
+                    unit, sign, a["price"], val, sym))
+                self.lbl_upd.config(text="🔔 تحقق تنبيه: {} {} {:.2f}".format(
+                    unit, a["op"], a["price"]), fg=self.theme["accent"])
+        if fired_msgs:
+            # إشعار سطح المكتب (Windows toast) + بطاقة داخل التطبيق
+            self.notify("تنبيه سعر الذهب", "\n".join(fired_msgs[:3]))
+        if changed:
+            self.save()
+            self.refresh_alert_list()
+
+    # ============================ الإعدادات ============================
+    # ============================ حاسبة تكلفة الشراء ============================
+    def open_calc(self):
+        """حاسبة التكلفة الفعلية: سعر الذهب + المصنعية + ضريبة القيمة المضافة."""
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+        win = self._open_page("calc", "حاسبة تكلفة الشراء")
+        win.configure(bg=BG)
+        win.geometry("760x520")
+        sym = CUR[self.cur]["sym"]
+
+        card = tk.Frame(win, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        card.pack(fill="both", expand=True, padx=4, pady=8)
+        tk.Label(card, text="🧮  احسب ما ستدفعه فعلياً قبل الشراء",
+                 bg=CARD, fg=GOLD, font=("Segoe UI", 13, "bold")).pack(
+            anchor="e", padx=24, pady=(16, 2))
+        tk.Label(card, text="سعر الذهب + المصنعية + ضريبة القيمة المضافة = التكلفة الفعلية",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(anchor="e", padx=24)
+        tk.Frame(card, bg=t.get("border", "#252c39"), height=1).pack(
+            fill="x", padx=24, pady=(10, 6))
+
+        form = tk.Frame(card, bg=CARD)
+        form.pack(fill="x", padx=24)
+        for c in range(3):
+            form.grid_columnconfigure(c, weight=1)
+
+        v_qty = tk.StringVar(value="10")
+        v_price = tk.StringVar(value="{:,.3f}".format(
+            self.current_per_unit_disp("g", self.karat)))
+        v_mk = tk.StringVar(value="3")
+        v_vat = tk.StringVar(value="15")
+        v_karat = tk.StringVar(value="{} قيراط".format(self.karat))
+
+        def field(row, col, label, var, width=12):
+            box = tk.Frame(form, bg=CARD)
+            box.grid(row=row, column=col, sticky="ew", padx=6, pady=(6, 2))
+            tk.Label(box, text=label, bg=CARD, fg=MUT,
+                     font=("Segoe UI", 11), anchor="e").pack(fill="x")
+            e = self._mkentry(box, var, width=width)
+            e.configure(justify="center")
+            e.pack(fill="x", ipady=5)
+            return e
+
+        field(0, 0, "الكمية (غرام)", v_qty)
+        field(0, 1, "سعر الغرام", v_price)
+        box_k = tk.Frame(form, bg=CARD)
+        box_k.grid(row=0, column=2, sticky="ew", padx=6, pady=(6, 2))
+        tk.Label(box_k, text="العيار", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 11), anchor="e").pack(fill="x")
+        ttk.OptionMenu(box_k, v_karat, v_karat.get(),
+                       *["{} قيراط".format(k) for k in KARATS]).pack(
+            fill="x", ipady=3)
+        field(1, 0, "المصنعية %", v_mk)
+        field(1, 1, "ضريبة القيمة المضافة %", v_vat)
+
+        res = tk.Frame(card, bg=t.get("card2", CARD), highlightthickness=1,
+                       highlightbackground=t.get("border", "#252c39"))
+        res.pack(fill="x", padx=24, pady=(14, 4))
+        out = {}
+        for i, (key, label) in enumerate((("gold", "قيمة الذهب"),
+                                          ("mk", "المصنعية"),
+                                          ("vat", "الضريبة"),
+                                          ("total", "الإجمالي المطلوب"),
+                                          ("per", "سعر الغرام الفعلي"))):
+            tk.Label(res, text=label, bg=t.get("card2", CARD), fg=MUT,
+                     font=("Segoe UI", 11), anchor="e").grid(
+                row=i, column=0, sticky="e", padx=(18, 10), pady=3)
+            lbl = tk.Label(res, text="--", bg=t.get("card2", CARD),
+                           fg=GOLD if key in ("total", "per") else TXT,
+                           font=("Segoe UI", 12 if key == "total" else 10, "bold"),
+                           anchor="w")
+            lbl.grid(row=i, column=1, sticky="w", pady=3)
+            out[key] = lbl
+        res.grid_columnconfigure(1, weight=1)
+
+        def calc(*_a):
+            try:
+                qty = float(str(v_qty.get()).replace(",", ""))
+                price = float(str(v_price.get()).replace(",", ""))
+                mk = float(str(v_mk.get()).replace(",", "") or 0)
+                vat = float(str(v_vat.get()).replace(",", "") or 0)
+            except (TypeError, ValueError):
+                for lbl in out.values():
+                    lbl.config(text="—")
+                return
+            if qty <= 0 or price < 0:
+                return
+            gold = qty * price
+            making = gold * mk / 100.0
+            sub = gold + making
+            tax = sub * vat / 100.0
+            total = sub + tax
+            out["gold"].config(text="{}{:,.2f}".format(sym, gold))
+            out["mk"].config(text="{}{:,.2f}".format(sym, making))
+            out["vat"].config(text="{}{:,.2f}".format(sym, tax))
+            out["total"].config(text="{}{:,.2f}".format(sym, total))
+            out["per"].config(text="{}{:,.2f}".format(sym, total / qty))
+
+        for var in (v_qty, v_price, v_mk, v_vat):
+            var.trace_add("write", calc)
+
+        def refresh_price(*_a):
+            try:
+                k = int(str(v_karat.get()).split()[0])
+            except (TypeError, ValueError):
+                k = 24
+            v_price.set("{:,.3f}".format(self.current_per_unit_disp("g", k)))
+
+        v_karat.trace_add("write", refresh_price)
+
+        bar = tk.Frame(card, bg=CARD)
+        bar.pack(fill="x", padx=24, pady=(10, 16))
+
+        def use_in_form():
+            try:
+                qty = float(str(v_qty.get()).replace(",", ""))
+                total_per = float(str(v_price.get()).replace(",", ""))
+                mk = float(str(v_mk.get()).replace(",", "") or 0)
+                vat = float(str(v_vat.get()).replace(",", "") or 0)
+            except (TypeError, ValueError):
+                messagebox.showinfo("حاسبة التكلفة", "أدخل كمية وسعراً صحيحين أولاً.",
+                                    parent=win)
+                return
+            if qty <= 0:
+                messagebox.showinfo("حاسبة التكلفة", "الكمية يجب أن تكون أكبر من صفر.",
+                                    parent=win)
+                return
+            per_gram = total_per * (1 + mk / 100.0) * (1 + vat / 100.0)
+            try:
+                k = int(str(v_karat.get()).split()[0])
+            except (TypeError, ValueError):
+                k = 24
+            win.go_back()
+            self.open_add_buy()
+            try:
+                self.ab_name.set("سبيكة عيار {}".format(k))
+                self.ab_qty.set("{:g}".format(qty))
+                self.ab_price.set("{:.2f}".format(per_gram))
+                self.ab_unit.set("غرام")
+                self.ab_karat.set("{} قيراط".format(k))
+                self._addbuy_total()
+            except Exception:
+                pass
+
+        self._mkbtn(bar, "🛒  تعبئة نموذج الشراء", use_in_form, kind="primary",
+                    font_size=11).pack(side="right", padx=(0, 10))
+        self._mkbtn(bar, "↺  إعادة ضبط",
+                    lambda: (v_qty.set("1"), v_mk.set("0"), v_vat.set("15")),
+                    kind="neutral", font_size=10).pack(side="right")
+        calc()
+
+    def _do_backup_now(self, parent=None):
+        path = self.auto_backup(force=True)
+        if path:
+            messagebox.showinfo("نسخ احتياطي",
+                                "تم إنشاء نسخة:\n{}".format(os.path.basename(path)),
+                                parent=parent)
+        else:
+            messagebox.showwarning("نسخ احتياطي", "تعذّر إنشاء نسخة احتياطية.",
+                                   parent=parent)
+
+    def _shortcut_buy(self):
+        if getattr(self, "locked", False) or not getattr(self, "user", None):
+            return
+        self.open_add_buy()
+
+    def _shortcut_home(self):
+        if getattr(self, "locked", False):
+            return
+        if getattr(self, "_page", "main") != "main":
+            self._show_page("main")
+
+    def open_settings(self):
+        t = self.theme
+        win = self._open_page("settings", "الإعدادات")
+        win.configure(bg=t["bg"])
+        win.geometry("480x520")
+        win.transient(self.root)
+        PAD = {"padx": 22, "pady": 7}
+        tk.Label(win, text="العناوين", bg=t["bg"], fg=t["accent"],
+                 font=("Segoe UI", 13, "bold")).pack(anchor="e", **PAD)
+        tvars = {}
+        for key, lbl in (("title", "العنوان"), ("subtitle", "العنوان الفرعي"),
+                         ("window", "عنوان النافذة")):
+            fr = tk.Frame(win, bg=t["bg"])
+            fr.pack(fill="x", **PAD)
+            tk.Label(fr, text=lbl, bg=t["bg"], fg=t["text"], width=14,
+                     anchor="e", font=("Segoe UI", 10)).pack(side="right")
+            v = tk.StringVar(value=self.titles.get(key, ""))
+            e = self._mkentry(fr, v, width=24)
+            e.configure(justify="right")
+            e.pack(side="right", fill="x", expand=True, padx=6, ipady=4)
+            tvars[key] = v
+
+        tk.Label(win, text="الألوان", bg=t["bg"], fg=t["accent"],
+                 font=("Segoe UI", 13, "bold")).pack(anchor="e", **PAD)
+        color_fields = [("bg", "خلفية التطبيق"), ("card", "البطاقات"),
+                        ("accent", "اللون المميز"), ("text", "لون النص"),
+                        ("profit", "لون الربح"), ("loss", "لون الخسارة"),
+                        ("total", "لون سطر الإجمالي")]
+        tmp = dict(self.theme)
+
+        def make_picker(k, swatch):
+            def pick():
+                c = colorchooser.askcolor(color=tmp.get(k), title="اختر لوناً", parent=win)
+                if c and c[1]:
+                    tmp[k] = c[1]
+                    swatch.config(bg=c[1])
+            return pick
+
+        for key, lbl in color_fields:
+            fr = tk.Frame(win, bg=t["bg"])
+            fr.pack(fill="x", **PAD)
+            tk.Label(fr, text=lbl, bg=t["bg"], fg=t["text"], width=16,
+                     anchor="e").pack(side="right")
+            sw = tk.Label(fr, text="        ", bg=tmp.get(key, "#000"),
+                          relief="flat", bd=0, highlightthickness=1,
+                          highlightbackground=t.get("border", "#252c39"))
+            sw.pack(side="right", padx=6)
+            self._mkbtn(fr, "اختيار لون", make_picker(key, sw),
+                        kind="neutral", font_size=8).pack(side="right", padx=4)
+
+        bkfr = tk.Frame(win, bg=t["bg"])
+        bkfr.pack(fill="x", padx=22, pady=(14, 0))
+        tk.Label(bkfr, text="💾 النسخ الاحتياطي", bg=t["bg"], fg=t["accent"],
+                 font=("Segoe UI", 11, "bold")).pack(side="right", padx=(0, 10))
+        self._mkbtn(bkfr, "نسخ احتياطي الآن",
+                    lambda: self._do_backup_now(win), kind="neutral",
+                    font_size=10).pack(side="right", padx=4)
+        self._mkbtn(bkfr, "♻ استعادة أحدث نسخة", self.restore_latest_backup,
+                    kind="danger", font_size=10).pack(side="right", padx=4)
+
+        btnfr = tk.Frame(win, bg=t["bg"])
+        btnfr.pack(fill="x", padx=22, pady=(16, 10))
+
+        def do_save():
+            for k, v in tvars.items():
+                self.titles[k] = v.get().strip() or DEFAULT_TITLES.get(k, "")
+            self.theme.update(tmp)
+            self.save()
+            win.destroy()
+            self.rebuild_ui()
+
+        def do_reset():
+            self.theme = dict(DEFAULT_THEME)
+            self.titles = dict(DEFAULT_TITLES)
+            self.source_mode = "auto"
+            self.save()
+            win.destroy()
+            self.rebuild_ui()
+
+        self._mkbtn(btnfr, "✔  حفظ وتطبيق", do_save, kind="primary",
+                    font_size=11).pack(side="right", padx=10)
+        self._mkbtn(btnfr, "استعادة الافتراضي", do_reset, kind="neutral",
+                    font_size=11).pack(side="right")
+
+    # ============================ تصدير Excel ============================
+    def export_excel(self):
+        if not self.holdings and not self.sells:
+            messagebox.showinfo("تصدير Excel", "لا توجد عمليات لتصديرها.")
+            return
+        default = "محفظة_الذهب_{}.xlsx".format(datetime.now().strftime("%Y%m%d_%H%M"))
+        path = filedialog.asksaveasfilename(
+            title="حفظ ملف Excel", defaultextension=".xlsx",
+            initialfile=default, filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        ccy = CUR[self.cur]["name"]
+        headers = ["الاسم", "الحالة", "الكمية", "الوحدة", "العيار",
+                   "سعر الشراء/وحدة ({})".format(ccy),
+                   "التكلفة ({})".format(ccy),
+                   "السعر الحالي/البيع ({})".format(ccy),
+                   "القيمة ({})".format(ccy),
+                   "الربح/الخسارة ({})".format(ccy), "النسبة %"]
+        rows = []
+        t_cost = t_val = 0.0
+        t_qty_g = 0.0
+        realized = 0.0
+        for h in self.holdings:
+            unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
+            cost_disp = h["qty"] * h["buy"] * self.rate()
+            karat = h.get("karat", 24)
+            cur_disp = self.current_per_unit_disp(h["unit"], karat)
+            value_disp = h["qty"] * cur_disp
+            pl = value_disp - cost_disp
+            pct = (pl / cost_disp * 100) if cost_disp else 0
+            t_cost += cost_disp
+            t_val += value_disp
+            t_qty_g += h["qty"] * (OZ_TO_G if h["unit"] == "oz" else 1)
+            rows.append([h["name"], "مفتوح", round(h["qty"], 6), unit_txt, karat,
+                         round(h["buy"] * self.rate(), 3), round(cost_disp, 3),
+                         round(cur_disp, 3), round(value_disp, 3),
+                         round(pl, 3), round(pct, 2)])
+        for s in self.sells:
+            unit_txt = "أونصة" if s["unit"] == "oz" else "غرام"
+            cost_disp = s["qty"] * s["buy"] * self.rate()
+            sell_disp = s["sell"] * self.rate()
+            s_karat = s.get("karat", 24)
+            value_disp = s["qty"] * sell_disp
+            pl = value_disp - cost_disp
+            pct = (pl / cost_disp * 100) if cost_disp else 0
+            realized += pl
+            rows.append(["{} ({})".format(s.get("name", "بيع"), s.get("date", "")),
+                         "مباع", round(s["qty"], 6), unit_txt, s_karat,
+                         round(s["buy"] * self.rate(), 3), round(cost_disp, 3),
+                         round(sell_disp, 3), round(value_disp, 3),
+                         round(pl, 3), round(pct, 2)])
+        t_pl = t_val - t_cost
+        t_pct = (t_pl / t_cost * 100) if t_cost else 0
+        rows.append(["∑ الرصيد المتبقي (غير محقق)", "", round(t_qty_g, 3), "غرام", "",
+                     "", round(t_cost, 3), "", round(t_val, 3),
+                     round(t_pl, 3), round(t_pct, 2)])
+        rows.append(["∑ الربح المحقق (المباع)", "", "", "", "", "", "", "", "",
+                     round(realized, 3), ""])
+        rows.append(["∑ الإجمالي (محقق + غير محقق)", "", "", "", "", "", "", "", "",
+                     round(t_pl + realized, 3), ""])
+        try:
+            write_xlsx(path, headers, rows)
+        except Exception as e:
+            messagebox.showerror("تصدير Excel", "تعذّر حفظ الملف:\n{}".format(e))
+            return
+        messagebox.showinfo("تصدير Excel",
+                            "تم تصدير {} سجل بنجاح.".format(len(self.holdings) + len(self.sells)))
+
+    # ============================ جلب البيانات المباشر ============================
+    def start_live_refresh(self):
+        if not getattr(self, "user", None):
+            return
+        if getattr(self, "_live_on", False):
+            self.refresh_all()
+            return
+        self._live_on = True
+        self.refresh_all()
+        self.root.after(30000, self._loop_refresh)
+
+    def _loop_refresh(self):
+        if not getattr(self, "_live_on", False) or not getattr(self, "user", None):
+            return
+        self.refresh_all()
+        self.root.after(30000, self._loop_refresh)
+
     def refresh_all(self):
         threading.Thread(target=self._fetch_once, daemon=True).start()
 
     def _fetch_once(self):
         msg = ""
-        direction = None   # 'up' / 'down' / 'same' / None(خطأ)
-        ok = False
+        direction = None
         try:
             new_price, source = fetch_spot_usd(self.source_mode)
             old_price = self.spot_oz_usd
@@ -1410,35 +4174,32 @@ class GoldApp:
             else:
                 direction = "same"
             self.spot_oz_usd = new_price
-            ok = True
             self._record_price_sample(new_price)
-            self._ticks = getattr(self, "_ticks", 0) + 1
+            self._ticks += 1
             self._fails = 0
             now = datetime.now().strftime("%H:%M:%S")
             self.last_update = now
-            # حفظ آخر سعر معروف دورياً لعرضه عند إعادة الفتح
             if self._ticks == 1 or self._ticks % 12 == 0:
                 self.save()
-            closed = "  •  🔒 السوق مغلق (عطلة نهاية الأسبوع) — السعر ثابت حتى الفتح" if market_closed() else ""
+            closed = "  •  🔒 السوق مغلق — السعر ثابت حتى الفتح" if market_closed() else ""
             msg = "● مباشر ({src}) • الأونصة ${p:.3f} • {t} • تحديثات {n}{c}".format(
                 src=source, p=new_price, t=now, n=self._ticks, c=closed)
         except Exception:
             direction = None
-            self._fails = getattr(self, "_fails", 0) + 1
+            self._fails += 1
             if self.spot_oz_usd:
-                # نحتفظ بآخر سعر ناجح بدل تجميد الشاشة
                 msg = "تعذّر التحديث (محاولة {})… عرض آخر سعر معروف".format(self._fails)
             else:
                 msg = "تعذّر جلب سعر الذهب — تحقق من الإنترنت"
 
-        # سعر الصرف نادر التغير — يُجلب مرة كل ~5 دقائق فقط (تجنّب الحظر)
         nowt = time.monotonic()
-        if nowt - getattr(self, "_fx_last", 0.0) > 300:
+        if nowt - self._fx_last > 300:
             try:
-                fx = http_json(FX_URL, timeout=8)
+                fx = http_json("https://open.er-api.com/v6/latest/USD", timeout=8)
                 if fx.get("rates"):
-                    self.rates["SAR"] = fx["rates"].get("SAR", self.rates["SAR"])
-                    self.rates["AED"] = fx["rates"].get("AED", self.rates["AED"])
+                    for k in ("SAR", "JOD", "KWD", "QAR", "EGP"):
+                        if k in fx["rates"]:
+                            self.rates[k] = fx["rates"][k]
                 self._fx_last = nowt
             except Exception:
                 pass
@@ -1448,20 +4209,16 @@ class GoldApp:
                                     self.flash_update(direction)))
 
     def flash_update(self, direction=None):
-        """وميض بصري لحظي عند وصول تحديث جديد للسعر."""
         t = self.theme
-        hi = {
-            "up": t.get("profit", "#2ecc71"),      # أخضر عند الزيادة
-            "down": t.get("loss", "#ff5c5c"),      # أحمر عند النزول
-            "same": t.get("flash_same", "#ffd93b"),  # أصفر عند ثبات السعر
-        }.get(direction, t.get("muted", "#888"))
+        hi = {"up": t.get("profit", "#2ecc71"),
+              "down": t.get("loss", "#ff5c5c"),
+              "same": t.get("flash_same", "#ffd93b")}.get(direction, t.get("muted", "#888"))
         rest = t.get("muted", "#888")
         try:
             self.dot.config(fg=hi)
         except Exception:
             pass
         originals = []
-        # الوميض فقط على خانة السعر الحالي (الغرام - السوق)
         for name in ("lbl_gr",):
             lbl = getattr(self, name, None)
             if lbl is None:
@@ -1482,25 +4239,24 @@ class GoldApp:
                 self.dot.config(fg=rest)
             except Exception:
                 pass
-
         self.root.after(260, revert)
 
-    # ---------- العرض ----------
+    # ============================ العرض ============================
     def render(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
         self.row_map = {}
         t_cost = t_val = 0.0
-        t_qty_g = 0.0            # إجمالي الكمية المتبقية (غرام)
-        realized = 0.0          # إجمالي الربح/الخسارة المحقق (المباع)
+        t_qty_g = 0.0
+        realized = 0.0
         sym = CUR[self.cur]["sym"]
         rowi = 0
-        # ===== المراكز المفتوحة (الرصيد المتبقي) =====
+        # المراكز المفتوحة
         for idx, h in enumerate(self.holdings):
             unit_txt = "أونصة" if h["unit"] == "oz" else "غرام"
-            cost_usd = h["qty"] * h["buy"]
-            cost_disp = cost_usd * self.rate()
-            cur_disp = self.current_per_unit_disp(h["unit"])
+            cost_disp = h["qty"] * h["buy"] * self.rate()
+            karat = h.get("karat", 24)
+            cur_disp = self.current_per_unit_disp(h["unit"], karat)
             value_disp = h["qty"] * cur_disp
             pl = value_disp - cost_disp
             pct = (pl / cost_disp * 100) if cost_disp else 0
@@ -1512,106 +4268,168 @@ class GoldApp:
             row_tags = (tag, stripe) if tag else (stripe,)
             iid = "h{}".format(idx)
             self.row_map[iid] = ("hold", idx)
-            self.tree.insert("", "end", iid=iid, tags=row_tags, values=(
-                h["name"],
-                "● مفتوح",
+            self.tree.insert("", "end", iid=iid, tags=row_tags,
+                             values=tuple(self._hide(_v) for _v in (
+                h["name"], "● مفتوح ({})".format(karat),
                 "{:g} {}".format(h["qty"], unit_txt),
                 "{}{:,.2f}".format(sym, h["buy"] * self.rate()),
                 "{}{:,.2f}".format(sym, cost_disp),
                 "{}{:,.2f}".format(sym, cur_disp),
                 "{}{:,.2f}".format(sym, value_disp),
+                "-",
                 "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
-                "{}{:.2f}%".format("+" if pl > 0 else "", pct),
-            ))
+                "{}{:.2f}%".format("+" if pl > 0 else "", pct))))
             rowi += 1
-        # ===== عمليات البيع (محققة — سطر أخضر بسعر بيع مثبّت) =====
+        # عمليات البيع (خضراء — سعر بيع مثبّت)
         for sidx, s in enumerate(self.sells):
-            qty_g = s["qty_g"]
-            cost_disp = s["cost"] * self.rate()
-            sell_disp = s["sell"] * self.rate()          # دولار/غرام × الصرف
-            value_disp = qty_g * sell_disp
+            unit_txt = "أونصة" if s["unit"] == "oz" else "غرام"
+            cost_disp = s["qty"] * s["buy"] * self.rate()
+            sell_disp = s["sell"] * self.rate()
+            s_karat = s.get("karat", 24)
+            value_disp = s["qty"] * sell_disp
             pl = value_disp - cost_disp
             pct = (pl / cost_disp * 100) if cost_disp else 0
             realized += pl
-            buy_per_g_disp = (cost_disp / qty_g) if qty_g else 0.0
             iid = "s{}".format(sidx)
             self.row_map[iid] = ("sell", sidx)
-            self.tree.insert("", "end", iid=iid, tags=("soldgreen",), values=(
+            self.tree.insert("", "end", iid=iid, tags=("soldgreen",),
+                             values=tuple(self._hide(_v) for _v in (
                 "💰 {}".format(s.get("name", "بيع ذهب")),
-                "✔ بيع",
-                "{:g} غرام".format(qty_g),
-                "{}{:,.2f}".format(sym, buy_per_g_disp),
+                "✔ بيع ({})".format(s_karat),
+                "{:g} {}".format(s["qty"], unit_txt),
+                "{}{:,.2f}".format(sym, s["buy"] * self.rate()),
                 "{}{:,.2f}".format(sym, cost_disp),
-                "{}{:,.2f}".format(sym, sell_disp),
+                "-",
                 "{}{:,.2f}".format(sym, value_disp),
+                "{}{:,.2f}".format(sym, sell_disp),
                 "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
-                "{}{:.2f}%".format("+" if pl > 0 else "", pct),
-            ))
+                "{}{:.2f}%".format("+" if pl > 0 else "", pct))))
         self.update_price_labels()
         self.check_alerts()
         t_pl = t_val - t_cost
         t_pct = (t_pl / t_cost * 100) if t_cost else 0
         total_pl = t_pl + realized
-        # ===== سطر إجمالي الرصيد المتبقي =====
         if self.holdings:
             ttag = "totalpos" if t_pl > 0 else ("totalneg" if t_pl < 0 else "total")
-            self.tree.insert("", "end", tags=(ttag,), values=(
-                "∑ الرصيد المتبقي",
-                "-",
-                "{:,.2f} غرام".format(t_qty_g),
-                "-",
-                "{}{:,.2f}".format(sym, t_cost),
-                "-",
-                "{}{:,.2f}".format(sym, t_val),
+            self.tree.insert("", "end", tags=(ttag,),
+                             values=tuple(self._hide(_v) for _v in (
+                "∑ الرصيد المتبقي", "-", "{:,.2f} غرام".format(t_qty_g),
+                "-", "{}{:,.2f}".format(sym, t_cost), "-",
+                "{}{:,.2f}".format(sym, t_val), "-",
                 "{}{}{:,.2f}".format("+" if t_pl > 0 else "", sym, t_pl),
-                "{}{:.2f}%".format("+" if t_pl > 0 else "", t_pct),
-            ))
+                "{}{:.2f}%".format("+" if t_pl > 0 else "", t_pct))))
         self.lbl_sum.config(
-            text=("الربح المحقق: {sg_r}{s}{r:,.2f}    |    غير المحقق: {sg_u}{s}{u:,.2f}    |    إجمالي الربح/الخسارة: {sg_t}{s}{tp:,.2f}").format(
-                s=sym, r=realized, u=t_pl, tp=total_pl,
-                sg_r="+" if realized > 0 else "",
-                sg_u="+" if t_pl > 0 else "",
-                sg_t="+" if total_pl > 0 else ""),
+            text=self._hide(
+                ("الربح المحقق: {sg_r}{s}{r:,.2f}    |    غير المحقق: {sg_u}{s}{u:,.2f}"
+                 "    |    إجمالي الربح/الخسارة: {sg_t}{s}{tp:,.2f}").format(
+                    s=sym, r=realized, u=t_pl, tp=total_pl,
+                    sg_r="+" if realized > 0 else "",
+                    sg_u="+" if t_pl > 0 else "",
+                    sg_t="+" if total_pl > 0 else "")),
             fg=self.theme["total"])
+        self._update_dashboard(t_qty_g, t_cost, t_val, t_pl)
 
     def update_price_labels(self):
         if self.spot_oz_usd:
             sym = CUR[self.cur]["sym"]
-            oz_disp = self.spot_oz_usd * self.rate()
-            self.lbl_oz.config(text="{}{:,.3f}".format(sym, oz_disp))
-            self.lbl_gr.config(text="{}{:,.3f}".format(sym, self.gram_market_disp()))
-            self.lbl_gr_buy.config(text="{}{:,.3f}".format(sym, self.gram_buy_disp()))
-            self.lbl_gr_adj.config(text="{}{:,.3f}".format(sym, self.gram_eff_disp()))
+            kf = karat_factor(self.karat)
+            # الأونصة العالمية تبقى بسعر الذهب الخالص
+            self.lbl_oz.config(text=self._hide("{}{:,.3f}".format(
+                sym, self.spot_oz_usd * self.rate())))
+            self.lbl_gr.config(text=self._hide("{}{:,.3f}".format(sym, self.gram_market_disp() * kf)))
+            self.lbl_gr_buy.config(text=self._hide("{}{:,.3f}".format(sym, self.gram_buy_disp() * kf)))
+            self.lbl_gr_adj.config(text=self._hide("{}{:,.3f}".format(sym, self.gram_eff_disp() * kf)))
+            bases = getattr(self, "_card_base_titles", {})
+            for attr in ("lbl_gr", "lbl_gr_buy", "lbl_gr_adj"):
+                lbl_t = getattr(self, attr + "_title", None)
+                if lbl_t is None or attr not in bases:
+                    continue
+                base = bases[attr]
+                lbl_t.config(text=base if self.karat == 24
+                             else "{} — عيار {}".format(base, self.karat))
             self._update_delta_indicator()
         else:
             for lbl in (self.lbl_oz, self.lbl_gr, self.lbl_gr_buy, self.lbl_gr_adj):
                 lbl.config(text="--")
+        self._refresh_widget()
+        self._refresh_chart_if_visible()
 
     def _update_delta_indicator(self):
-        """مؤشر تغيّر سعر الغرام السوقي منذ آخر تحديث."""
         lbl = getattr(self, "lbl_delta", None)
         if lbl is None:
             return
         t = self.theme
         sym = CUR[self.cur]["sym"]
-        delta_oz = getattr(self, "_delta_oz", 0.0) or 0.0
+        delta_oz = self._delta_oz or 0.0
         if abs(delta_oz) < 1e-9 or not self.spot_oz_usd:
-            lbl.config(text="━ ثابت", fg=t.get("flash_same", "#ffd93b"))
+            lbl.config(text=self._hide("━ ثابت"), fg=t.get("flash_same", "#ffd93b"))
             return
-        gram_delta_disp = (delta_oz / OZ_TO_G) * self.rate()
+        gram_delta = (delta_oz / OZ_TO_G) * self.rate()
         prev_oz = self.spot_oz_usd - delta_oz
         pct = (delta_oz / prev_oz * 100) if prev_oz else 0.0
         if delta_oz > 0:
             arrow, color = "▲", t.get("profit", "#2ecc71")
         else:
             arrow, color = "▼", t.get("loss", "#ff5c5c")
-        lbl.config(
-            text="{a} {sym}{d:,.3f}/غ ({p:+.2f}%)".format(
-                a=arrow, sym=sym, d=abs(gram_delta_disp), p=pct),
-            fg=color)
+        lbl.config(text=self._hide("{a} {sym}{d:,.3f}/غ ({p:+.2f}%)".format(
+            a=arrow, sym=sym, d=abs(gram_delta), p=pct)), fg=color)
+
+
+# ============================ تصدير Excel ============================
+def write_xlsx(path, headers, rows):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        raise RuntimeError("مكتبة openpyxl غير مثبّتة. نفّذ: pip install openpyxl")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "محفظة الذهب"
+    ws.sheet_view.rightToLeft = True
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E79")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for r in rows:
+        ws.append(r)
+    for col in ws.columns:
+        width = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max(width + 4, 12), 34)
+    wb.save(path)
+
+
+def _enable_dpi_awareness():
+    """خطوط حادة على شاشات ويندوز عالية الدقة + معرفة نسبة التكبير."""
+    global SYSTEM_DPI
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+        try:
+            dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        except Exception:
+            dpi = 0
+        if not dpi:
+            try:
+                hdc = ctypes.windll.user32.GetDC(0)
+                dpi = int(ctypes.windll.gdi32.GetDeviceCaps(hdc, 88))  # LOGPIXELSX
+                ctypes.windll.user32.ReleaseDC(0, hdc)
+            except Exception:
+                dpi = 96
+        if dpi and 72 <= dpi <= 480:
+            SYSTEM_DPI = dpi
+    except Exception:
+        pass
 
 
 def main():
+    _enable_dpi_awareness()
     root = tk.Tk()
     GoldApp(root)
     root.mainloop()
