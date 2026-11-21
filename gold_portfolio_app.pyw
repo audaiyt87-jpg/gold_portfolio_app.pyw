@@ -2588,6 +2588,11 @@ class GoldApp:
                                 foreground=t["profit"], font=("Segoe UI", 11, "bold"))
         self.tree.pack(side="top", fill="both", expand=True)
         self.tree_x.pack(side="bottom", fill="x", pady=(2, 0))
+        # نقر مزدوج على أي عملية شراء => فتح أمر البيع عليها مباشرة
+        try:
+            self.tree.bind("<Double-1>", self._tree_dblclick)
+        except Exception:
+            pass
 
         # الأزرار: كل الخيارات في شطر واحد (بلا «أمر بيع» — البيع من
         # زر «إضافة عملية (شراء / بيع)» أو Ctrl+S)
@@ -2989,117 +2994,317 @@ class GoldApp:
             self.render()
 
     # ============================ أمر البيع ============================
-    def open_sell(self):
+    def _tree_dblclick(self, event=None):
+        """نقر مزدوج على سطر عملية شراء => أمر بيع عليها."""
+        iid = ""
+        try:
+            if event is not None:
+                iid = self.tree.identify_row(event.y)
+        except Exception:
+            iid = ""
+        if not iid:
+            try:
+                sel = self.tree.selection()
+                iid = sel[0] if sel else ""
+            except Exception:
+                iid = ""
+        kind_idx = getattr(self, "row_map", {}).get(iid)
+        if not kind_idx or kind_idx[0] != "hold":
+            return
+        self.open_sell(preselect=kind_idx[1])
+
+    def open_sell(self, preselect=None):
+        """صفحة أمر البيع: تختار عملية الشراء + الكمية + طريقة السعر
+        (السعر الحالي للراجحي أو سعر تُدخله أنت)."""
         if not self.holdings:
             messagebox.showinfo("أمر بيع", "لا يوجد رصيد مفتوح لبيعه")
             return
         t = self.theme
         BG, CARD = t["bg"], t["card"]
+        CARD2 = t.get("card2", "#1a2029")
         GOLD, TXT, MUT = t["accent"], t["text"], t["muted"]
+        PROF = t.get("profit", "#3ddc97")
+        LOSS = t.get("loss", "#ff6b6b")
+        BORD = t.get("border", "#252c39")
+        EBG = t.get("entry_bg", "#151a23")
         sym = CUR[self.cur]["sym"]
-        win = self._open_page("sell", "أمر بيع — اختر عملية الشراء")
+        uname = CUR[self.cur]["name"]
+        px = self._px
+
+        win = self._open_page("sell", "أمر بيع — اختر العملية وسعر البيع")
         win.configure(bg=BG)
-        win.geometry("560x460")
         win.transient(self.root)
         win.grab_set()
 
-        frm = tk.LabelFrame(win, text="  💰 بيع من عمليات الشراء  ", bg=CARD, fg=GOLD,
-                            font=("Segoe UI", 11, "bold"), bd=0,
-                            highlightthickness=1,
-                            highlightbackground=t.get("border", "#252c39"))
-        frm.pack(fill="both", expand=True, padx=4, pady=8)
+        def mkcard(title):
+            f = tk.LabelFrame(win, text="  {}  ".format(title), bg=CARD, fg=GOLD,
+                              font=("Segoe UI", 11, "bold"), bd=0,
+                              highlightthickness=1, highlightbackground=BORD)
+            f.pack(fill="x", padx=px(4), pady=(px(6), px(4)))
+            return f
 
-        tk.Label(frm, text="اختر عملية الشراء التي تريد بيعها:", bg=CARD, fg=TXT,
-                 font=("Segoe UI", 10)).pack(anchor="e", padx=10, pady=(8, 2))
-        # قائمة عمليات الشراء المفتوحة
-        list_fr = tk.Frame(frm, bg=CARD)
-        list_fr.pack(fill="x", padx=10, pady=4)
-        sb = tk.Scrollbar(list_fr)
+        def lot_grams(h):
+            return float(h.get("qty", 0)) * (OZ_TO_G if h.get("unit") == "oz" else 1)
+
+        def lot_unit(h):
+            return "أونصة" if h.get("unit") == "oz" else "غرام"
+
+        def lot_price_now(h):
+            try:
+                return float(self.current_per_unit_disp(h.get("unit", "g"),
+                                                        h.get("karat", 24)))
+            except Exception:
+                return 0.0
+
+        # ---------------- ١) اختيار عملية الشراء ----------------
+        c1 = mkcard("١) اختر عملية الشراء التي تريد بيعها")
+        list_fr = tk.Frame(c1, bg=CARD)
+        list_fr.pack(fill="x", padx=px(10), pady=(px(8), px(2)))
+        sb = tk.Scrollbar(list_fr, width=px(14))
         sb.pack(side="left", fill="y")
-        lb = tk.Listbox(list_fr, height=6, bg=t.get("entry_bg", "#151a23"),
-                        fg=TXT, selectbackground=t.get("border", "#2c3a52"),
+        lb = tk.Listbox(list_fr, height=6, bg=EBG, fg=TXT,
+                        selectbackground=t.get("select", "#2c3a52"),
                         selectforeground="#ffffff", relief="flat", bd=0,
-                        highlightthickness=1,
-                        highlightbackground=t.get("border", "#252c39"),
-                        font=("Segoe UI", 11), yscrollcommand=sb.set)
+                        highlightthickness=1, highlightbackground=BORD,
+                        font=("Segoe UI", 10), yscrollcommand=sb.set,
+                        activestyle="none", exportselection=False)
         lb.pack(side="right", fill="x", expand=True)
         sb.config(command=lb.yview)
         for i, h in enumerate(self.holdings):
-            ut = "أونصة" if h["unit"] == "oz" else "غرام"
-            lb.insert("end", "{}. {} — {:g} {} (عيار {}) @ {}{:,.2f}".format(
-                i + 1, h["name"], h["qty"], ut, h.get("karat", 24), sym,
-                h["buy"] * self.rate()))
-        lb.selection_set(0)
+            lb.insert("end", "{n}.  {nm}  —  {q:g} {u}  •  عيار {k}  •  شراء {s}{p:,.2f}".format(
+                n=i + 1, nm=h.get("name", "بدون اسم"), q=float(h.get("qty", 0)),
+                u=lot_unit(h), k=h.get("karat", 24), s=sym,
+                p=float(h.get("buy", 0)) * self.rate()))
+        try:
+            first = int(preselect) if preselect is not None else 0
+        except Exception:
+            first = 0
+        if not (0 <= first < len(self.holdings)):
+            first = 0
+        lb.selection_set(first)
+        lb.see(first)
 
-        # الكمية
-        r2 = tk.Frame(frm, bg=CARD)
-        r2.pack(fill="x", padx=10, pady=6)
-        tk.Label(r2, text="الكمية المباعة:", bg=CARD, fg=TXT,
+        lbl_info = tk.Label(c1, text="", bg=CARD, fg=MUT, justify="right",
+                            anchor="e", font=("Segoe UI", 10))
+        lbl_info.pack(fill="x", padx=px(12), pady=(px(2), px(8)))
+
+        # ---------------- ٢) الكمية ----------------
+        c2 = mkcard("٢) الكمية المباعة")
+        r2 = tk.Frame(c2, bg=CARD)
+        r2.pack(fill="x", padx=px(10), pady=(px(10), px(4)))
+        var_qty = tk.StringVar()
+        e_qty = self._mkentry(r2, var_qty, width=13)
+        e_qty.pack(side="right", padx=px(6), ipady=px(4))
+        tk.Label(r2, text="الكمية:", bg=CARD, fg=TXT,
                  font=("Segoe UI", 10)).pack(side="right")
-        e_qty = self._mkentry(r2, tk.StringVar(), width=12)
-        e_qty.pack(side="right", padx=6, ipady=4)
         lbl_max = tk.Label(r2, text="", bg=CARD, fg=MUT, font=("Segoe UI", 10))
-        lbl_max.pack(side="right", padx=4)
+        lbl_max.pack(side="right", padx=px(6))
+        bar_q = tk.Frame(c2, bg=CARD)
+        bar_q.pack(fill="x", padx=px(10), pady=(0, px(8)))
 
-        # سعر البيع
-        r3 = tk.Frame(frm, bg=CARD)
-        r3.pack(fill="x", padx=10, pady=6)
-        tk.Label(r3, text="سعر البيع/وحدة ({}):".format(CUR[self.cur]["name"]),
-                 bg=CARD, fg=TXT, font=("Segoe UI", 10)).pack(side="right")
-        e_price = self._mkentry(r3, tk.StringVar(), width=12)
-        e_price.pack(side="right", padx=6, ipady=4)
-        tk.Label(r3, text=("(الراجحي للبيع الآن)" if self.cur == "SAR"
-                           else "(السعر العالمي الآن)"),
-                 bg=CARD, fg=MUT,
-                 font=("Segoe UI", 10)).pack(side="right", padx=4)
+        # ---------------- ٣) سعر البيع ----------------
+        c3 = mkcard("٣) سعر البيع — اختر الطريقة")
+        r3 = tk.Frame(c3, bg=CARD)
+        r3.pack(fill="x", padx=px(10), pady=(px(10), px(4)))
+        mode = tk.StringVar(value="current")
+        rb_kw = dict(bg=CARD, fg=TXT, selectcolor=CARD2, activebackground=CARD,
+                     activeforeground=GOLD, font=("Segoe UI", 10),
+                     highlightthickness=0, bd=0, anchor="e", justify="right")
+        rb_cur = tk.Radiobutton(r3, text="السعر الحالي (الراجحي للبيع)",
+                                variable=mode, value="current", **rb_kw)
+        rb_mine = tk.Radiobutton(r3, text="سعر أحدده بنفسي",
+                                 variable=mode, value="manual", **rb_kw)
+        rb_cur.pack(side="right", padx=px(2))
+        rb_mine.pack(side="right", padx=px(10))
 
-        lbl_prev = tk.Label(frm, text="", bg=CARD, fg=GOLD,
-                            font=("Segoe UI", 11, "bold"), justify="right")
-        lbl_prev.pack(anchor="e", padx=12, pady=6)
+        r4 = tk.Frame(c3, bg=CARD)
+        r4.pack(fill="x", padx=px(10), pady=(px(2), px(2)))
+        var_price = tk.StringVar()
+        price_e = tk.Entry(r4, textvariable=var_price, width=14, justify="center",
+                           bg=EBG, fg=GOLD, insertbackground=TXT, relief="flat",
+                           bd=0, highlightthickness=1, highlightbackground=BORD,
+                           highlightcolor=GOLD, font=("Segoe UI", 12, "bold"),
+                           readonlybackground=CARD2)
+        lbl_price_title = tk.Label(r4, text="سعر البيع:", bg=CARD, fg=TXT,
+                                   font=("Segoe UI", 10))
+        lbl_price_title.pack(side="right")
+        lbl_unit_hint = tk.Label(r4, text="", bg=CARD, fg=MUT,
+                                 font=("Segoe UI", 10))
+        lbl_unit_hint.pack(side="right", padx=px(4))
+        price_e.pack(side="right", padx=px(6), ipady=px(4))
+        btn_ref = self._mkbtn(r4, "⟳  تحديث", lambda: refill_price(False),
+                              kind="neutral", font_size=10)
+        btn_ref.pack(side="left", padx=px(4))
+        lbl_ind = tk.Label(c3, text="", bg=CARD, fg=MUT, anchor="e",
+                           justify="right", font=("Segoe UI", 10))
+        lbl_ind.pack(fill="x", padx=px(12), pady=(0, px(8)))
+
+        # ---------------- المعاينة والتأكيد ----------------
+        lbl_prev = tk.Label(win, text="", bg=BG, fg=GOLD, justify="right",
+                            anchor="e", font=("Segoe UI", 12, "bold"))
+        lbl_prev.pack(fill="x", padx=px(16), pady=(px(4), px(2)))
+
+        state = {"after": None, "open_price": None}
 
         def sel_index():
             s = lb.curselection()
-            return s[0] if s else 0
+            return int(s[0]) if s else 0
 
-        def on_select(*_):
+        def refill_price(quiet=True):
             i = sel_index()
             if i >= len(self.holdings):
                 return
-            h = self.holdings[i]
-            ut = "أونصة" if h["unit"] == "oz" else "غرام"
-            e_qty.delete(0, "end")
-            e_qty.insert(0, "{:g}".format(h["qty"]))
-            lbl_max.config(text="(الأقصى {:g} {})".format(h["qty"], ut))
-            cur = self.current_per_unit_disp(h["unit"], h.get("karat", 24))
-            if cur:
-                e_price.delete(0, "end")
-                e_price.insert(0, "{:.2f}".format(cur))
-            preview()
+            p = lot_price_now(self.holdings[i])
+            if not p:
+                if not quiet:
+                    messagebox.showinfo("السعر الحالي",
+                                        "لم يُجلب سعر السوق بعد — اضغط ⟳ أعلى "
+                                        "النافذة الرئيسية ثم أعد المحاولة.", parent=win)
+                return
+            var_price.set("{:,.2f}".format(p))
+            base = state.get("open_price")
+            if base is None:
+                state["open_price"] = p
+            if base and abs(p - base) > 0.004:
+                d = p - base
+                try:
+                    lbl_ind.config(
+                        fg=PROF if d > 0 else LOSS,
+                        text="{sg}{s}{d:,.2f}  ({pc:+.1f}%)  منذ فتح الصفحة".format(
+                            sg="▲ " if d > 0 else "▼ ", s=sym, d=abs(d),
+                            pc=(d / base * 100) if base else 0))
+                except Exception:
+                    pass
+            else:
+                try:
+                    lbl_ind.config(fg=MUT,
+                                   text="سعر لحظي — يُحدَّث تلقائياً كل ٥ ثوانٍ")
+                except Exception:
+                    pass
 
-        def preview(*_):
+        def preview(*_a):
             i = sel_index()
             if i >= len(self.holdings):
                 lbl_prev.config(text="")
                 return
             h = self.holdings[i]
             try:
-                qty = float(e_qty.get())
-                price_disp = float(e_price.get())
+                q = float(str(var_qty.get()).replace(",", "").strip() or 0)
+                p = float(str(var_price.get()).replace(",", "").strip() or 0)
             except ValueError:
                 lbl_prev.config(text="")
                 return
-            if qty <= 0 or price_disp <= 0:
+            if q <= 0 or p <= 0:
                 lbl_prev.config(text="")
                 return
-            val = qty * price_disp
-            cost = qty * h["buy"] * self.rate()
+            val = q * p
+            cost = q * float(h.get("buy", 0)) * self.rate()
             pl = val - cost
-            lbl_prev.config(text="قيمة البيع: {s}{v:,.2f}\nالربح/الخسارة: {sg}{s}{p:,.2f}".format(
-                s=sym, v=val, p=pl, sg="+" if pl > 0 else ""))
+            pct = (pl / cost * 100.0) if cost else 0.0
+            lbl_prev.config(
+                fg=GOLD,
+                text="قيمة البيع: {s}{v:,.2f}   •   التكلفة: {s}{c:,.2f}   •   "
+                     "الربح/الخسارة: {sg}{s}{p:,.2f} ({pc:+.1f}%)".format(
+                         s=sym, v=val, c=cost, p=pl, pc=pct,
+                         sg="+" if pl > 0 else ("−" if pl < 0 else "")))
+
+        def on_select(*_a):
+            i = sel_index()
+            if i >= len(self.holdings):
+                return
+            h = self.holdings[i]
+            qty = float(h.get("qty", 0))
+            var_qty.set("{:g}".format(qty))
+            lbl_max.config(text="(المتاح {:g} {})".format(qty, lot_unit(h)))
+            lbl_unit_hint.config(text="للـ{}".format(lot_unit(h)))
+            now_p = lot_price_now(h)
+            try:
+                val_now = qty * now_p
+                cost = qty * float(h.get("buy", 0)) * self.rate()
+                pl = val_now - cost
+                pct = (pl / cost * 100.0) if cost else 0.0
+                lbl_info.config(
+                    fg=TXT,
+                    text="التكلفة: {s}{c:,.2f}  •  قيمة اليوم: {s}{v:,.2f}  •  "
+                         "ربح غير محقق: {sg}{s}{p:,.2f} ({pc:+.1f}%)".format(
+                             s=sym, c=cost, v=val_now, p=pl, pc=pct,
+                             sg="+" if pl > 0 else ("−" if pl < 0 else "")))
+            except Exception:
+                lbl_info.config(text="")
+            if state.get("open_price") is None:
+                state["open_price"] = now_p or None
+            if mode.get() == "current":
+                refill_price(True)
+            preview()
+
+        def apply_mode(*_a):
+            if mode.get() == "current":
+                try:
+                    price_e.config(state="readonly", fg=GOLD,
+                                   readonlybackground=CARD2)
+                    btn_ref.config(state="normal")
+                except Exception:
+                    pass
+                refill_price(True)
+            else:
+                try:
+                    price_e.config(state="normal", fg=GOLD)
+                    btn_ref.config(state="disabled")
+                    lbl_ind.config(fg=MUT,
+                                   text="اكتب سعر البيع الذي تريده بالـ" + uname +
+                                        " (يُثبَّت كما هو عند التأكيد)")
+                    price_e.focus_set()
+                    price_e.selection_range(0, "end")
+                except Exception:
+                    pass
+            preview()
+
+        def fill_all():
+            i = sel_index()
+            if i < len(self.holdings):
+                var_qty.set("{:g}".format(float(self.holdings[i].get("qty", 0))))
+
+        def fill_half():
+            i = sel_index()
+            if i < len(self.holdings):
+                var_qty.set("{:g}".format(round(float(self.holdings[i].get("qty", 0)) / 2.0, 3)))
+
+        self._mkbtn(bar_q, "الكل", fill_all, kind="neutral",
+                    font_size=10).pack(side="right", padx=px(4))
+        self._mkbtn(bar_q, "النصف", fill_half, kind="neutral",
+                    font_size=10).pack(side="right", padx=px(4))
 
         lb.bind("<<ListboxSelect>>", on_select)
-        e_qty.bind("<KeyRelease>", preview)
-        e_price.bind("<KeyRelease>", preview)
+        var_qty.trace_add("write", preview)
+        var_price.trace_add("write", preview)
+        mode.trace_add("write", apply_mode)
+
+        def key_open():
+            try:
+                info = self._pages.get("sell")
+                return bool(info) and info.get("body") is win and win.winfo_exists()
+            except Exception:
+                return False
+
+        def tick():
+            state["after"] = None
+            if not key_open():
+                return
+            if mode.get() == "current":
+                refill_price(True)
+            try:
+                state["after"] = self.root.after(5000, tick)
+            except Exception:
+                pass
+
+        def stop_tick():
+            a = state.get("after")
+            if a:
+                try:
+                    self.root.after_cancel(a)
+                except Exception:
+                    pass
+                state["after"] = None
 
         def do_sell():
             i = sel_index()
@@ -3107,57 +3312,73 @@ class GoldApp:
                 return
             h = self.holdings[i]
             try:
-                qty = float(e_qty.get())
-                price_disp = float(e_price.get())
-            except ValueError:
-                messagebox.showwarning("تنبيه", "الرجاء إدخال كمية وسعر بيع صحيحين", parent=win)
+                qty = float(str(var_qty.get()).replace(",", "").strip())
+                price_disp = float(str(var_price.get()).replace(",", "").strip())
+            except (TypeError, ValueError):
+                messagebox.showwarning("تنبيه", "أدخل كمية وسعر بيع صحيحين", parent=win)
                 return
             if qty <= 0 or price_disp <= 0:
-                messagebox.showwarning("تنبيه", "الكمية والسعر يجب أن يكونا أكبر من صفر", parent=win)
+                messagebox.showwarning("تنبيه", "الكمية والسعر يجب أن يكونا أكبر من صفر",
+                                       parent=win)
                 return
-            if qty > h["qty"] + 1e-9:
-                messagebox.showwarning("تنبيه", "الكمية أكبر من المتاح في هذه العملية", parent=win)
+            if qty > float(h.get("qty", 0)) + 1e-9:
+                messagebox.showwarning("تنبيه", "الكمية أكبر من المتاح في هذه العملية",
+                                       parent=win)
                 return
             sell_usd = price_disp / self.rate()
             sell_date = datetime.now().strftime("%Y-%m-%d %H:%M")
             self.sells.append({
-                "name": h["name"],
+                "name": h.get("name", "بدون اسم"),
                 "qty": qty,
-                "unit": h["unit"],
-                "buy": h["buy"],
+                "unit": h.get("unit", "g"),
+                "buy": float(h.get("buy", 0)),
                 "sell": sell_usd,
                 "karat": h.get("karat", 24),
                 "date": sell_date,
+                "price_mode": mode.get(),
             })
-            factor = OZ_TO_G if h["unit"] == "oz" else 1
+            factor = OZ_TO_G if h.get("unit") == "oz" else 1
             self.history.append({
-                "type": "sell", "name": h["name"],
+                "type": "sell", "name": h.get("name", "بدون اسم"),
                 "qty_g": qty * factor, "price_usd": sell_usd / factor,
                 "amount_usd": qty * sell_usd,
-                "cost_usd": qty * h["buy"],
-                "pl_usd": qty * (sell_usd - h["buy"]),
+                "cost_usd": qty * float(h.get("buy", 0)),
+                "pl_usd": qty * (sell_usd - float(h.get("buy", 0))),
                 "karat": h.get("karat", 24),
                 "date": sell_date,
             })
-            # خصم الكمية من عملية الشراء
-            if abs(qty - h["qty"]) < 1e-9:
+            if abs(qty - float(h.get("qty", 0))) < 1e-9:
                 del self.holdings[i]
             else:
-                h["qty"] -= qty
+                h["qty"] = float(h.get("qty", 0)) - qty
             self.save()
             self.render()
-            win.destroy()
+            stop_tick()
+            try:
+                self.toast("تم تسجيل البيع", "{:g} {} بـ{}{:,.2f} للوحدة".format(
+                    qty, lot_unit(h), sym, price_disp))
+            except Exception:
+                pass
+            self._close_page("sell")
+
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=px(12), pady=(px(4), px(10)))
+        self._mkbtn(bar, "✔  تأكيد البيع", do_sell, kind="success",
+                    font_size=11).pack(side="right", padx=px(6))
+        self._mkbtn(bar, "إلغاء", lambda: (stop_tick(), self._close_page("sell")),
+                    kind="neutral", font_size=10).pack(side="right", padx=px(6))
+        tk.Label(bar, text="السعر يُثبَّت لحظة التأكيد — لا يتغيّر بعدها مع تغيّر السوق.\n"
+                          "تلميح: النقر المزدوج على أي عملية شراء في الجدول يفتحها هنا مباشرة.",
+                 bg=BG, fg=MUT, justify="right",
+                 font=("Segoe UI", 9)).pack(side="left", padx=px(6))
 
         on_select()
-
-        bar = tk.Frame(frm, bg=CARD)
-        bar.pack(fill="x", padx=10, pady=12)
-        self._mkbtn(bar, "✔ تأكيد البيع", do_sell, kind="success",
-                    font_size=10).pack(side="right", padx=6)
-        self._mkbtn(bar, "إلغاء", win.destroy, kind="neutral",
-                    font_size=10).pack(side="right", padx=6)
-        tk.Label(frm, text="سعر البيع يُثبّت عند لحظة البيع ويُحسب الربح/الخسارة عليه.",
-                 bg=CARD, fg=MUT, font=("Segoe UI", 10)).pack(anchor="e", padx=12)
+        apply_mode()
+        try:
+            state["open_price"] = lot_price_now(self.holdings[sel_index()]) or None
+            state["after"] = self.root.after(5000, tick)
+        except Exception:
+            pass
 
     # ============================ سجل العمليات ============================
     def open_history(self):
