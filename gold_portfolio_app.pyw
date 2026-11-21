@@ -23,6 +23,15 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, colorchooser, filedialog
 import urllib.request
+import urllib.error
+import urllib.parse
+import socket
+import smtplib
+import imaplib
+import ssl
+import webbrowser
+from email.mime.text import MIMEText
+from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
@@ -94,6 +103,287 @@ def verify_password(password, salt_hex, hash_hex):
         return hmac.compare_digest(calc, hash_hex or "")
     except Exception:
         return False
+
+# ============================ المزامنة السحابية (Firebase) ============================
+# تُحفظ إعدادات المزامنة في ملف مستقل حتى لا تتأثر ببيانات المحفظة
+CLOUD_FILE = os.path.join(HOME_DIR, "gold_portfolio_cloud.json")
+FB_SIGNUP = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={key}"
+FB_SIGNIN = ("https://identitytoolkit.googleapis.com/v1/accounts:"
+             "signInWithPassword?key={key}")
+FB_REFRESH = "https://securetoken.googleapis.com/v1/token?key={key}"
+FB_RESET = ("https://identitytoolkit.googleapis.com/v1/accounts:"
+            "sendOobCode?key={key}")
+
+# ==================== إعداد الخادم (مرة واحدة فقط) ====================
+# الصق هنا رابط قاعدة بيانات مشروعك في Firebase ومفتاح الويب.
+# بعد ذلك لا يرى المستخدم أي رابط: يسجّل بالبريد وكلمة المرور فقط،
+# وتُسترجع بياناته تلقائياً على أي جهاز.
+FB_URL = ""
+FB_KEY = ""
+
+# ==================== المزامنة عبر البريد (Gmail) ====================
+# لا قاعدة بيانات ولا رابط: تُحفظ نسخة مشفّرة في رسالة داخل بريدك نفسه،
+# ويستعيدها أي جهاز يسجّل بالبريد نفسه + كلمة مرور التطبيق.
+GMAIL_SMTP = "smtp.gmail.com"
+GMAIL_IMAP = "imap.gmail.com"
+GMAIL_PORT_SMTP = 465
+GMAIL_PORT_IMAP = 993
+SYNC_SUBJECT = "GOLDPORTFOLIO-SYNC"
+SYNC_MARK = "===== GOLDPORTFOLIO SYNC ====="
+
+FB_ERRORS = {
+    "EMAIL_EXISTS": "هذا البريد مسجَّل سابقاً — استخدم زر «دخول» بدل «إنشاء حساب».",
+    "EMAIL_NOT_FOUND": "لا يوجد حساب سحابي بهذا البريد.",
+    "INVALID_PASSWORD": "كلمة المرور غير صحيحة.",
+    "INVALID_LOGIN_CREDENTIALS": "البريد أو كلمة المرور غير صحيحة.",
+    "WEAK_PASSWORD": "كلمة المرور قصيرة — يجب أن تكون ٦ أحرف على الأقل.",
+    "OPERATION_NOT_ALLOWED": "تسجيل الدخول بالبريد غير مُفعّل — فعّل Email/Password "
+                             "في مشروع Firebase.",
+    "CONFIGURATION_NOT_FOUND": "مفتاح المشروع (API key) غير صحيح.",
+    "API_KEY_INVALID": "مفتاح الويب (API key) غير صحيح.",
+    "INVALID_EMAIL": "صيغة البريد الإلكتروني غير صحيحة.",
+    "MISSING_PASSWORD": "أدخل كلمة المرور.",
+    "PERMISSION_DENIED": "لا توجد صلاحية للوصول إلى قاعدة البيانات — راجع قواعد "
+                         "الأمان في Firebase.",
+}
+
+# المفاتيح التي تُزامن بين الأجهزة (أسعار السوق والسجل اللحظي تبقى محلية)
+SYNC_KEYS = ("holdings", "sells", "history", "alerts", "cur", "karat",
+             "chart_range", "adjust", "buy_margin", "theme", "titles",
+             "sound_on", "source_mode", "dark_mode", "lock_minutes")
+
+
+class CloudError(Exception):
+    """خطأ في المزامنة السحابية برسالة عربية جاهزة للعرض."""
+
+    def __init__(self, msg, status=0):
+        super().__init__(msg)
+        self.status = status
+
+
+def load_cloud():
+    """يقرأ إعدادات المزامنة (روابط/رموز الدخول) من ملفها المستقل."""
+    try:
+        with open(CLOUD_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError
+    except Exception:
+        d = {}
+    d.setdefault("url", "")
+    d.setdefault("key", "")
+    d.setdefault("auto", True)
+    if not isinstance(d.get("accounts"), dict):
+        d["accounts"] = {}
+    return d
+
+
+def save_cloud(conf):
+    """حفظ إعدادات المزامنة كتابةً ذرّية مع تقييد صلاحيات الملف."""
+    try:
+        tmp = CLOUD_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(conf, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CLOUD_FILE)
+        try:
+            os.chmod(CLOUD_FILE, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def cloud_http(method, url, payload=None, headers=None, timeout=15):
+    """طلب JSON إلى خدمات Firebase (يعيد البيانات و ETag)."""
+    body = None
+    h = {"User-Agent": BROWSER_UA, "Accept": "application/json"}
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        h["Content-Type"] = "application/json"
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=body, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "ignore")
+            etag = r.headers.get("ETag") or r.headers.get("Etag") or ""
+            return (json.loads(raw) if raw.strip() else None), etag
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        code = ""
+        try:
+            err = json.loads(raw).get("error", {})
+            if isinstance(err, dict):
+                code = str(err.get("message", "") or "").split(" ")[0]
+                if not code:
+                    msg = err.get("errors", [{}])[0].get("message", "")
+                    code = str(msg)
+            else:
+                code = str(err)
+        except Exception:
+            code = ""
+        if e.code == 412:
+            raise CloudError("تغيّرت البيانات في السحابة من جهاز آخر.", 412)
+        if e.code == 401:
+            raise CloudError("انتهت صلاحية الجلسة — أعد ربط الحساب السحابي.", 401)
+        if e.code == 403:
+            raise CloudError(FB_ERRORS["PERMISSION_DENIED"], 403)
+        raise CloudError(FB_ERRORS.get(code) or
+                         "خطأ في الاتصال بالسحابة ({}).".format(e.code), e.code)
+    except Exception as e:
+        raise CloudError("تعذّر الاتصال بالإنترنت: {}".format(e))
+
+
+# ---------------- تعمية نسخة البريد (مكتبة قياسية فقط) ----------------
+def _sync_keys(secret, email):
+    """يشتق مفتاحَي التعمية والتحقق من كلمة مرور التطبيق."""
+    pw = "".join((secret or "").split())
+    raw = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                              ("goldport|" + (email or "").lower()).encode("utf-8"),
+                              120000, dklen=64)
+    return raw[:32], raw[32:]
+
+
+def _keystream(key, nonce, n):
+    out = bytearray()
+    i = 0
+    while len(out) < n:
+        out += hmac.new(key, nonce + i.to_bytes(8, "big"), hashlib.sha256).digest()
+        i += 1
+    return bytes(out[:n])
+
+
+def seal_sync(obj, secret, email):
+    """يحوّل البيانات إلى نص مشفّر (AES-less: HMAC-SHA256 CTR + MAC)."""
+    enc, mac = _sync_keys(secret, email)
+    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    nonce = os.urandom(16)
+    ct = bytes(a ^ b for a, b in zip(data, _keystream(enc, nonce, len(data))))
+    tag = hmac.new(mac, b"GP1" + nonce + ct, hashlib.sha256).digest()
+    return base64.b64encode(b"GP1" + nonce + ct + tag).decode("ascii")
+
+
+def open_sync(blob, secret, email):
+    """يفكّ نصاً مشفّراً أنتجته seal_sync."""
+    enc, mac = _sync_keys(secret, email)
+    txt = "".join(str(blob or "").split())
+    if not txt:
+        raise CloudError("لا توجد نسخة في بريدك بعد.")
+    try:
+        raw = base64.b64decode(txt)
+    except Exception:
+        raise CloudError("نسخة البريد غير صالحة.")
+    if len(raw) < 3 + 16 + 32 or not raw.startswith(b"GP1"):
+        raise CloudError("نسخة البريد غير صالحة.")
+    nonce, ct, tag = raw[3:19], raw[19:-32], raw[-32:]
+    calc = hmac.new(mac, b"GP1" + nonce + ct, hashlib.sha256).digest()
+    if not hmac.compare_digest(tag, calc):
+        raise CloudError("تعذّر فتح النسخة — كلمة مرور التطبيق غير مطابقة.")
+    data = bytes(a ^ b for a, b in zip(ct, _keystream(enc, nonce, len(ct))))
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        raise CloudError("تعذّر قراءة بيانات النسخة.")
+
+
+def gmail_check(email, pw):
+    """يتأكد أن البريد وكلمة مرور التطبيق يعملان (IMAP)."""
+    email = (email or "").strip()
+    pw = "".join((pw or "").split())
+    if "@" not in email or "." not in email:
+        raise CloudError("أدخل بريد Gmail صحيحاً.")
+    if len(pw) < 8:
+        raise CloudError("أدخل «كلمة مرور التطبيق» (16 حرفاً) لا كلمة مرور حسابك.")
+    M = None
+    try:
+        M = imaplib.IMAP4_SSL(GMAIL_IMAP, GMAIL_PORT_IMAP, timeout=25)
+        M.login(email, pw)
+        return True
+    except imaplib.IMAP4.error as e:
+        msg = str(e).lower()
+        if "auth" in msg or "credentials" in msg or "login" in msg:
+            raise CloudError("البريد أو كلمة مرور التطبيق غير صحيحة.\n"
+                             "استخدم «كلمة مرور التطبيق» من إعدادات أمان Google.")
+        raise CloudError("تعذّر الاتصال بالبريد: {}".format(e))
+    except (socket.error, ssl.SSLError, OSError) as e:
+        raise CloudError("تعذّر الاتصال بالبريد — تحقق من الإنترنت: {}".format(e))
+    finally:
+        if M is not None:
+            try:
+                M.logout()
+            except Exception:
+                pass
+
+
+def gmail_send(email, pw, blob):
+    """يرسل نسخة المزامنة إلى البريد نفسه."""
+    email = (email or "").strip()
+    pw = "".join((pw or "").split())
+    msg = MIMEText(SYNC_MARK + "\n" + blob, "plain", "utf-8")
+    msg["Subject"] = SYNC_SUBJECT
+    msg["From"] = email
+    msg["To"] = email
+    msg["X-Gold-Sync"] = "1"
+    try:
+        with smtplib.SMTP_SSL(GMAIL_SMTP, GMAIL_PORT_SMTP, timeout=30) as s:
+            s.login(email, pw)
+            s.send_message(msg)
+        return True
+    except smtplib.SMTPAuthenticationError:
+        raise CloudError("رفض Gmail كلمة مرور التطبيق — أنشئ واحدة جديدة.")
+    except (smtplib.SMTPException, socket.error, ssl.SSLError, OSError) as e:
+        raise CloudError("تعذّر إرسال النسخة إلى بريدك: {}".format(e))
+
+
+def mail_body(raw):
+    """يستخرج نص الرسالة من بايتاتها الخام (يفكّ ترميز base64)."""
+    try:
+        msg = message_from_bytes(raw)
+        data = msg.get_payload(decode=True)
+        if data is None:
+            data = b""
+        return data.decode("utf-8", "ignore")
+    except Exception:
+        return raw.decode("utf-8", "ignore")
+
+
+def gmail_blobs(email, pw, limit=6):
+    """يعيد نصوص أحدث نسخ المزامنة الموجودة في البريد (الأحدث أولاً)."""
+    email = (email or "").strip()
+    pw = "".join((pw or "").split())
+    M = None
+    out = []
+    try:
+        M = imaplib.IMAP4_SSL(GMAIL_IMAP, GMAIL_PORT_IMAP, timeout=30)
+        M.login(email, pw)
+        M.select("INBOX", readonly=True)
+        typ, data = M.search(None, '(SUBJECT "{}")'.format(SYNC_SUBJECT))
+        ids = (data[0].split() if data and data[0] else [])
+        for i in ids[-limit:][::-1]:
+            typ, d = M.fetch(i, "(BODY.PEEK[])")
+            raw = b""
+            for part in (d or []):
+                if isinstance(part, tuple) and len(part) > 1:
+                    raw += part[1]
+            text = mail_body(raw)
+            if SYNC_MARK in text:
+                out.append(text.split(SYNC_MARK, 1)[1].strip())
+        return out
+    except imaplib.IMAP4.error as e:
+        raise CloudError("تعذّر قراءة بريدك: {}".format(e))
+    except (socket.error, ssl.SSLError, OSError) as e:
+        raise CloudError("تعذّر الاتصال بالبريد — تحقق من الإنترنت: {}".format(e))
+    finally:
+        if M is not None:
+            try:
+                M.close()
+            except Exception:
+                pass
+            try:
+                M.logout()
+            except Exception:
+                pass
+
 
 # العملات المدعومة (أُزيل الدرهم الإماراتي وأُضيف الدينار الأردني)
 CUR = {
@@ -1227,6 +1517,959 @@ class GoldApp:
                 pass
         self.show_login()
 
+    # ============================ المزامنة السحابية ============================
+    def sync_snapshot(self):
+        """البيانات التي تُزامن بين الأجهزة (بلا أسعار السوق اللحظية)."""
+        d = {"holdings": getattr(self, "holdings", []),
+             "sells": getattr(self, "sells", []),
+             "history": getattr(self, "history", []),
+             "alerts": getattr(self, "alerts", []),
+             "theme": getattr(self, "theme", {}),
+             "titles": getattr(self, "titles", {}),
+             "cur": self.cur,
+             "karat": self.karat,
+             "chart_range": getattr(self, "chart_range", "day"),
+             "adjust": getattr(self, "adjust", 5.22),
+             "buy_margin": getattr(self, "buy_margin", 0.0),
+             "sound_on": bool(getattr(self, "sound_on", True)),
+             "source_mode": getattr(self, "source_mode", "auto"),
+             "dark_mode": bool(getattr(self, "dark_mode", True)),
+             "lock_minutes": int(getattr(self, "lock_minutes", 10) or 0)}
+        try:
+            return json.loads(json.dumps(d, ensure_ascii=False, default=str))
+        except Exception:
+            return d
+
+    def cloud_hash(self):
+        try:
+            raw = json.dumps(self.sync_snapshot(), ensure_ascii=False, sort_keys=True)
+            return hashlib.md5(raw.encode("utf-8")).hexdigest()
+        except Exception:
+            return ""
+
+    def cloud_conf(self):
+        if not hasattr(self, "_cloud_config"):
+            self._cloud_config = load_cloud()
+        return self._cloud_config
+
+    def cloud_store(self):
+        return save_cloud(self.cloud_conf())
+
+    def cloud_server(self):
+        """رابط القاعدة ومفتاح الويب: ما في الإعدادات، وإلا المضمّن في التطبيق."""
+        conf = self.cloud_conf()
+        url = FB_URL.strip().rstrip("/") or (conf.get("url") or "").strip().rstrip("/")
+        key = FB_KEY.strip() or (conf.get("key") or "").strip()
+        return url, key
+
+    def cloud_builtin(self):
+        """هل التطبيق مهيّأ بخادم مزامنة مضمّن؟ (دخول بالبريد فقط)"""
+        return bool(FB_URL.strip() and FB_KEY.strip())
+
+    def cloud_account(self, user=None):
+        key = user if user is not None else (getattr(self, "user", None) or "")
+        if not key:
+            return {}
+        return dict((self.cloud_conf().get("accounts") or {}).get(key) or {})
+
+    def cloud_update_account(self, user, **kw):
+        conf = self.cloud_conf()
+        acct = dict((conf.get("accounts") or {}).get(user) or {})
+        acct.update(kw)
+        conf.setdefault("accounts", {})[user] = acct
+        self.cloud_store()
+        return acct
+
+    def cloud_ready(self):
+        acct = self.cloud_account()
+        if self.cloud_provider() == "gmail":
+            return bool(acct.get("email") and acct.get("gmail_pw"))
+        return bool(acct.get("refresh_token") and self.cloud_server()[0])
+
+    def cloud_provider(self):
+        """طريقة المزامنة المرتبطة بهذا المستخدم: gmail أو firebase."""
+        acct = self.cloud_account()
+        p = acct.get("provider")
+        if p:
+            return p
+        if acct.get("refresh_token"):
+            return "firebase"
+        if acct.get("gmail_pw"):
+            return "gmail"
+        return ""
+
+    @staticmethod
+    def _pw_wrap(pw):
+        return base64.b64encode(
+            "".join((pw or "").split()).encode("utf-8")).decode("ascii")
+
+    @staticmethod
+    def _pw_unwrap(v):
+        try:
+            return base64.b64decode(str(v or "").encode("ascii")).decode("utf-8")
+        except Exception:
+            return ""
+
+    def gmail_creds(self, user=None):
+        """(البريد، كلمة مرور التطبيق) للحساب المرتبط."""
+        acct = self.cloud_account(user)
+        return (acct.get("email", "").strip(), self._pw_unwrap(acct.get("gmail_pw")))
+
+    def gmail_push(self):
+        """يحفظ نسخة مشفّرة في بريد المستخدم نفسه."""
+        email, pw = self.gmail_creds()
+        if not email or not pw:
+            return False, "لم يُربط البريد بعد."
+        acct = self.cloud_account()
+        rev = int(acct.get("rev") or 0) + 1
+        payload = {"rev": rev, "updated_ts": time.time(),
+                   "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                   "device": socket.gethostname(),
+                   "data": self.sync_snapshot()}
+        try:
+            blob = seal_sync(payload, pw, email)
+            gmail_send(email, pw, blob)
+        except CloudError as e:
+            return False, "☁ {}".format(e)
+        self.cloud_update_account(self.user, rev=rev,
+                                  last_sync=payload["updated_at"],
+                                  last_hash=self.cloud_hash(),
+                                  last_device=payload["device"])
+        self._gmail_last = time.time()
+        return True, "☁ محفوظة في بريدك — {}".format(payload["updated_at"])
+
+    def gmail_pull(self, user=None):
+        """يجلب أحدث نسخة من بريد المستخدم (أو None)."""
+        email, pw = self.gmail_creds(user)
+        if not email or not pw:
+            return None
+        blobs = gmail_blobs(email, pw)
+        best = None
+        for b in blobs:
+            try:
+                d = open_sync(b, pw, email)
+            except CloudError:
+                continue
+            if isinstance(d, dict) and int(d.get("rev") or 0) >= int((best or {}).get("rev") or 0):
+                best = d
+        return best
+
+    # ---------- نسخة بملف واحد: أبسط طريقة نقل بين الأجهزة (بلا بريد ولا كلمة مرور) ----------
+    def pocket_export(self, parent=None):
+        """يحفظ كل بياناتك في ملف واحد صغير (.gold) لنقله بين الأجهزة."""
+        par = parent or self.root
+        try:
+            who = re.sub(r"[^A-Za-z0-9._-]", "_", (self.user or "portfolio"))
+            default = "GoldPortfolio-{}-{}.gold".format(
+                who, datetime.now().strftime("%Y-%m-%d"))
+            path = filedialog.asksaveasfilename(
+                parent=par, title="حفظ نسخة في ملف",
+                defaultextension=".gold", initialfile=default,
+                filetypes=[("ملف محفظة الذهب", "*.gold"), ("كل الملفات", "*.*")])
+            if not path:
+                return
+            if not path.lower().endswith(".gold"):
+                path += ".gold"
+            payload = {"app": "gold_portfolio", "kind": "pocket", "ver": 1,
+                       "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                       "device": socket.gethostname(),
+                       "user": self.user or "",
+                       "data": self.sync_snapshot()}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=1)
+            kb = max(1, os.path.getsize(path) // 1024)
+            messagebox.showinfo(
+                "نسخة بملف",
+                "تم حفظ نسخة كاملة من بياناتك في:\n{}\n({} كيلوبايت)\n\n"
+                "أرسل الملف لنفسك (واتساب/تيليجرام) أو ضعه في مجلد Google Drive، "
+                "وفي الجهاز الآخر اختر «استعادة من ملف».".format(os.path.basename(path), kb),
+                parent=par)
+        except Exception as e:
+            messagebox.showerror("نسخة بملف", "تعذّر حفظ الملف:\n{}".format(e),
+                                 parent=par)
+
+    def pocket_import(self):
+        """يستعيد البيانات من ملف .gold (بعد حفظ نسخة احتياطية من بيانات الجهاز)."""
+        try:
+            path = filedialog.askopenfilename(
+                parent=self.root, title="استعادة من ملف",
+                filetypes=[("ملف محفظة الذهب", "*.gold"), ("كل الملفات", "*.*")])
+            if not path:
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            data = obj.get("data") if isinstance(obj, dict) else None
+            if not isinstance(data, dict) or not any(k in data for k in SYNC_KEYS):
+                messagebox.showerror("استعادة من ملف",
+                                     "هذا الملف غير صالح أو ليس ملف محفظة.",
+                                     parent=self.root)
+                return
+            n = len(data.get("holdings") or [])
+            when = obj.get("created") or "—"
+            if not messagebox.askyesno(
+                    "استعادة من ملف",
+                    "سيتم استبدال بيانات هذا الجهاز ببيانات الملف:\n\n"
+                    "الملف: {}\nالتاريخ: {}\nعدد العمليات: {}\n\n"
+                    "تُحفظ نسخة من بياناتك الحالية قبل الاستبدال. متابعة؟".format(
+                        os.path.basename(path), when, n),
+                    parent=self.root):
+                return
+            try:
+                self.auto_backup(force=True)
+            except Exception:
+                pass
+            target = getattr(self, "data_file", None) or DATA_FILE
+            self._cloud_skip = True
+            try:
+                base = {}
+                try:
+                    with open(target, "r", encoding="utf-8") as f:
+                        base = json.load(f) or {}
+                except Exception:
+                    base = {}
+                if not isinstance(base, dict):
+                    base = {}
+                base.update({k: data[k] for k in SYNC_KEYS if k in data})
+                tmp = target + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(base, f, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, target)
+            finally:
+                self._cloud_skip = False
+            self._reset_state()
+            self.load()
+            try:
+                self.rebuild_ui()
+                self.start_live_refresh()
+            except Exception:
+                pass
+            # اجعل نسخة الجهاز هي الأحدث في السحابة (إن كان البريد مرتبطاً)
+            try:
+                if self.cloud_ready() and self.cloud_conf().get("auto", True):
+                    threading.Thread(target=self.cloud_push, daemon=True).start()
+            except Exception:
+                pass
+            messagebox.showinfo("استعادة من ملف",
+                                "تم استرجاع {} عملية من الملف.".format(n),
+                                parent=self.root)
+        except Exception as e:
+            messagebox.showerror("استعادة من ملف", "تعذّر فتح الملف:\n{}".format(e),
+                                 parent=self.root)
+
+    def cloud_status(self, text, kind="idle"):
+        self._cloud_msg = text
+        self._cloud_kind = kind
+        lbl = getattr(self, "lbl_cloud", None)
+        if lbl is not None:
+            try:
+                colors = {"ok": self.theme.get("profit", "#3ddc97"),
+                          "err": self.theme.get("loss", "#ff6b6b"),
+                          "busy": self.theme.get("accent", "#e9c684"),
+                          "idle": self.theme.get("muted", "#888")}
+                lbl.config(text=text, fg=colors.get(kind, colors["idle"]))
+            except Exception:
+                pass
+        btn = getattr(self, "btn_cloud", None)
+        if btn is not None:
+            try:
+                btn.config(text={"ok": "☁", "err": "⚠", "busy": "☁"}.get(kind, "☁"))
+            except Exception:
+                pass
+
+    def cloud_db_base(self):
+        url = self.cloud_server()[0]
+        if not url:
+            raise CloudError("لم يُضبط خادم المزامنة — راجع إعداد Firebase.")
+        if not url.startswith("http"):
+            url = "https://" + url
+        return url
+
+    def cloud_db_url(self, uid):
+        if not uid:
+            raise CloudError("لم يُربط حساب سحابي بعد.")
+        return "{}/goldPortfolio/users/{}.json".format(self.cloud_db_base(), uid)
+
+    def cloud_token(self, user=None, force=False):
+        """يعيد رمز دخول صالحاً (ويجدّده تلقائياً عند انتهاء صلاحيته)."""
+        uname = user if user is not None else (getattr(self, "user", None) or "")
+        acct = self.cloud_account(uname)
+        if not acct.get("refresh_token"):
+            raise CloudError("لم يُربط حساب سحابي بهذا المستخدم.")
+        if (not force) and acct.get("id_token") and \
+                time.time() < float(acct.get("expires", 0) or 0) - 120:
+            return acct["id_token"]
+        key = self.cloud_server()[1]
+        body = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": acct["refresh_token"]}).encode("utf-8")
+        req = urllib.request.Request(
+            FB_REFRESH.format(key=urllib.parse.quote(key)), data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent": BROWSER_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.loads(r.read().decode("utf-8", "ignore"))
+        except urllib.error.HTTPError as e:
+            raise CloudError("انتهت صلاحية الجلسة — أعد ربط الحساب السحابي.", e.code)
+        except Exception as e:
+            raise CloudError("تعذّر الاتصال بالإنترنت: {}".format(e))
+        tok = d.get("id_token") or d.get("idToken") or ""
+        if not tok:
+            raise CloudError("تعذّر تجديد جلسة الدخول — أعد الربط.")
+        self.cloud_update_account(uname, id_token=tok,
+                                  refresh_token=d.get("refresh_token",
+                                                       acct["refresh_token"]),
+                                  expires=time.time() + float(d.get("expires_in", 3600) or 3600),
+                                  uid=acct.get("uid") or d.get("user_id", ""))
+        return tok
+
+    def cloud_auth(self, email, pw, url="", key="", mode="login"):
+        """دخول/إنشاء حساب سحابي بالبريد وكلمة المرور فقط."""
+        burl, bkey = self.cloud_server()
+        url = (url or burl or "").strip().rstrip("/")
+        if not url:
+            raise CloudError("لم يُضبط خادم المزامنة بعد — راجع إعداد Firebase.")
+        if not url.startswith("http"):
+            url = "https://" + url
+        key = (key or bkey or "").strip()
+        if not key:
+            raise CloudError("لم يُضبط مفتاح الخادم بعد — راجع إعداد Firebase.")
+        email = (email or "").strip()
+        if "@" not in email or "." not in email:
+            raise CloudError("أدخل بريداً إلكترونياً صحيحاً.")
+        if len(pw or "") < 6:
+            raise CloudError("كلمة المرور يجب أن تكون ٦ أحرف على الأقل.")
+        ep = FB_SIGNUP if mode == "register" else FB_SIGNIN
+        data, _etag = cloud_http(
+            "POST", ep.format(key=urllib.parse.quote(key)),
+            {"email": email, "password": pw, "returnSecureToken": True}, timeout=20)
+        if not isinstance(data, dict) or not data.get("idToken"):
+            raise CloudError("لم يكتمل تسجيل الدخول — تحقق من إعدادات Firebase.")
+        conf = self.cloud_conf()
+        conf["last_email"] = email
+        if not self.cloud_builtin():
+            conf["url"] = url
+            conf["key"] = key
+        self.cloud_store()
+        return {"uid": data.get("localId", ""), "email": email,
+                "id_token": data.get("idToken", ""),
+                "refresh_token": data.get("refreshToken", ""),
+                "expires": time.time() + float(data.get("expiresIn", 3600) or 3600)}
+
+    def cloud_reset_password(self, email):
+        """يرسل رابط إعادة تعيين كلمة المرور إلى البريد."""
+        email = (email or "").strip()
+        if "@" not in email or "." not in email:
+            raise CloudError("اكتب بريدك في الحقل أولاً ثم اضغط «نسيت كلمة المرور».")
+        key = self.cloud_server()[1]
+        if not key:
+            raise CloudError("لم يُضبط خادم المزامنة بعد.")
+        data, _etag = cloud_http(
+            "POST", FB_RESET.format(key=urllib.parse.quote(key)),
+            {"requestType": "PASSWORD_RESET", "email": email}, timeout=20)
+        if isinstance(data, dict) and data.get("error"):
+            raise CloudError("تعذّر إرسال الرابط — تأكد من البريد.")
+        return "أرسلنا رابط إعادة تعيين كلمة المرور إلى {}".format(email)
+
+    def cloud_login_device(self, info, pw):
+        """ينشئ/يحدّث حساباً محلياً مرتبطاً بالحساب السحابي ويعيد اسمه."""
+        email = info.get("email", "")
+        users = load_users()
+        target = None
+        for u, a in (self.cloud_conf().get("accounts") or {}).items():
+            if str(a.get("email", "")).lower() == email.lower():
+                target = u
+                break
+        if target is None:
+            base = re.sub(r"[^A-Za-z0-9._\-]", "_", email.split("@")[0]) or "user"
+            cand, i = base, 2
+            low = {k.lower() for k in users}
+            while cand.lower() in low:
+                cand = "{}{}".format(base, i)
+                i += 1
+            target = cand
+        salt, h = hash_password(pw)
+        rec = dict(users.get(target) or {})
+        rec.update({"salt": salt, "hash": h, "email": email,
+                    "created": rec.get("created") or
+                    datetime.now().strftime("%Y-%m-%d %H:%M")})
+        users[target] = rec
+        if not save_users(users):
+            raise CloudError("تعذّر إنشاء الحساب المحلي على هذا الجهاز.")
+        old = self.cloud_account(target)
+        acct = dict(old)
+        same = (str(old.get("email", "")).strip().lower() == email.strip().lower())
+        acct.update(info)
+        if old.get("uid") and old.get("uid") != info.get("uid"):
+            acct.update({"rev": 0, "etag": "", "last_hash": ""})
+        if info.get("provider") == "gmail" and not same:
+            acct.update({"rev": 0, "last_hash": ""})
+        acct.setdefault("rev", 0)
+        conf = self.cloud_conf()
+        conf.setdefault("accounts", {})[target] = acct
+        self.cloud_store()
+        prefs = load_prefs()
+        prefs["last_user"] = target
+        save_prefs(prefs)
+        return target
+
+    def cloud_fetch(self, user=None):
+        uname = user if user is not None else (getattr(self, "user", None) or "")
+        acct = self.cloud_account(uname)
+        if (acct.get("provider") or "") == "gmail":
+            return self.gmail_pull(uname)
+        token = self.cloud_token(uname)
+        url = self.cloud_db_url(acct.get("uid")) + "?auth=" + urllib.parse.quote(token)
+        data, _etag = cloud_http("GET", url, None, timeout=20)
+        return data
+
+    def cloud_download_to_file(self, user):
+        """يجلب نسخة السحابة ويكتبها في ملف المستخدم (بنسخة احتياطية قبل الاستبدال)."""
+        data = self.cloud_fetch(user)
+        if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+            return False
+        payload = data["data"]
+        path = user_data_file(user)
+        if os.path.exists(path) and os.path.getsize(path) > 2:
+            try:
+                shutil.copyfile(path, path + ".before-sync")
+            except Exception:
+                pass
+        try:
+            base = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    base = json.load(f) or {}
+            if not isinstance(base, dict):
+                base = {}
+            base.update({k: payload[k] for k in SYNC_KEYS if k in payload})
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(base, f, ensure_ascii=False)
+        except Exception as e:
+            raise CloudError("تعذّر حفظ البيانات المسترجعة: {}".format(e))
+        self.cloud_update_account(user, rev=int(data.get("rev", 0) or 0),
+                                  last_sync=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                  last_hash="")
+        self._cloud_pulled = True
+        return True
+
+    def cloud_push(self, quiet=True):
+        """يرفع نسخة الجهاز إلى السحابة. يعيد (نجاح، رسالة)."""
+        if not getattr(self, "user", None) or not self.cloud_ready():
+            return False, "لم يُربط حساب سحابي بعد."
+        if self.cloud_provider() == "gmail":
+            return self.gmail_push()
+        acct = self.cloud_account()
+        try:
+            token = self.cloud_token()
+        except CloudError as e:
+            return False, "☁ {}".format(e)
+        payload = {"rev": int(acct.get("rev") or 0) + 1,
+                   "updated_ts": time.time(),
+                   "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                   "device": socket.gethostname(),
+                   "data": self.sync_snapshot()}
+        try:
+            url = self.cloud_db_url(acct.get("uid")) + "?auth=" + urllib.parse.quote(token)
+            cloud_http("PUT", url, payload, timeout=20)
+        except CloudError as e:
+            return False, "☁ تعذّرت المزامنة: {}".format(e)
+        self.cloud_update_account(self.user, rev=payload["rev"],
+                                  last_sync=payload["updated_at"],
+                                  last_hash=self.cloud_hash(),
+                                  last_device=payload["device"])
+        return True, "☁ متزامن — {}".format(payload["updated_at"])
+
+    def cloud_apply_remote(self, remote):
+        """يستبدل بيانات الجهاز بنسخة السحابة (بعد نسخة احتياطية)."""
+        payload = (remote or {}).get("data") or {}
+        try:
+            self.auto_backup(force=True)
+        except Exception:
+            pass
+        path = getattr(self, "data_file", None) or DATA_FILE
+        self._cloud_skip = True
+        try:
+            base = {}
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    base = json.load(f) or {}
+            except Exception:
+                base = {}
+            if not isinstance(base, dict):
+                base = {}
+            base.update({k: payload[k] for k in SYNC_KEYS if k in payload})
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(base, f, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except Exception as e:
+                raise CloudError("تعذّر حفظ البيانات: {}".format(e))
+            self._reset_state()
+            self.load()
+            self.cloud_update_account(
+                self.user, rev=int(remote.get("rev", 0) or 0),
+                last_sync=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                last_hash=self.cloud_hash())
+            self._cloud_pulled = True
+        finally:
+            self._cloud_skip = False
+        try:
+            self.rebuild_ui()
+            self.start_live_refresh()
+        except Exception:
+            pass
+
+    def cloud_touch(self):
+        """بعد أي حفظ محلي: يرفع للسحابة بعد مهلة قصيرة (تجميع التعديلات)."""
+        try:
+            if getattr(self, "_cloud_skip", False):
+                return
+            if not self.cloud_ready() or not self.cloud_conf().get("auto", True):
+                return
+            if self.cloud_hash() == (self.cloud_account().get("last_hash") or ""):
+                return
+            job = getattr(self, "_cloud_job", None)
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+            delay = 4000
+            if self.cloud_provider() == "gmail":
+                # البريد ليس قاعدة بيانات: نجمّع التعديلات ونرسل رسالة كل 3 دقائق
+                gap = 180 - (time.time() - float(getattr(self, "_gmail_last", 0) or 0))
+                delay = max(delay, int(gap * 1000))
+            self._cloud_job = self.root.after(delay, self._cloud_push_async)
+        except Exception:
+            pass
+
+    def _cloud_push_async(self):
+        self._cloud_job = None
+        if not self.cloud_ready():
+            return
+
+        def work():
+            ok, msg = self.cloud_push()
+            try:
+                self.root.after(0, lambda: self.cloud_status(msg, "ok" if ok else "err"))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def cloud_sync_now(self, manual=True):
+        """مزامنة كاملة: تنزيل الأحدث ثم رفع تعديلات الجهاز إن وُجدت."""
+        if not getattr(self, "user", None):
+            return
+        if not self.cloud_ready():
+            if manual:
+                self.open_cloud_dialog()
+            return
+        self.cloud_status("☁ جارٍ المزامنة…", "busy")
+
+        def work():
+            try:
+                remote = self.cloud_fetch()
+            except CloudError as e:
+                try:
+                    self.root.after(0, lambda: self.cloud_status("☁ " + str(e), "err"))
+                except Exception:
+                    pass
+                return
+            try:
+                self.root.after(0, lambda: self._cloud_after_fetch(remote, manual))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cloud_after_fetch(self, remote, manual=True):
+        acct = self.cloud_account()
+        if not isinstance(remote, dict):
+            self._cloud_push_async()
+            return
+        rrev = int(remote.get("rev") or 0)
+        lrev = int(acct.get("rev") or 0)
+        last_hash = acct.get("last_hash") or ""
+        local_changed = (self.cloud_hash() != last_hash) if last_hash else \
+            bool(self.holdings or self.history or self.sells)
+        if rrev > lrev and local_changed:
+            ask3 = getattr(messagebox, "askyesnocancel", None)
+            q = ("توجد نسخة أحدث في السحابة، وبيانات هذا الجهاز تغيّرت أيضاً.\n\n"
+                 "نعم = استخدم بيانات السحابة (تُحفظ نسخة من بياناتك الحالية)\n"
+                 "لا = ارفع بيانات هذا الجهاز لتصبح هي النسخة السحابية\n"
+                 "إلغاء = لاحقاً")
+            ans = ask3("مزامنة", q) if ask3 else messagebox.askyesno("مزامنة", q)
+            if ans is None:
+                self.cloud_status("☁ المزامنة مؤجلة", "idle")
+                return
+            if ans:
+                self.cloud_apply_remote(remote)
+                self.cloud_status("☁ تم استرجاع بيانات السحابة", "ok")
+            else:
+                self._cloud_push_async()
+            return
+        if rrev > lrev:
+            self.cloud_apply_remote(remote)
+            self.cloud_status("☁ تم استرجاع بيانات السحابة", "ok")
+            return
+        if local_changed:
+            self._cloud_push_async()
+            return
+        self.cloud_status("☁ متزامن — {}".format(
+            remote.get("updated_at") or acct.get("last_sync") or ""), "ok")
+
+    def cloud_unlink(self):
+        if not getattr(self, "user", None):
+            return
+        if not messagebox.askyesno("فصل الحساب السحابي",
+                                   "هل تريد فصل هذا الجهاز عن الحساب السحابي؟\n"
+                                   "بياناتك تبقى على الجهاز والسحابة كما هي."):
+            return
+        conf = self.cloud_conf()
+        (conf.get("accounts") or {}).pop(self.user, None)
+        self.cloud_store()
+        self.cloud_status("☁ غير مرتبط — البيانات محلية", "idle")
+        try:
+            self.open_settings()
+        except Exception:
+            pass
+
+    def open_gmail_dialog(self, from_login=False):
+        """ربط الحساب بالبريد فقط: بريد + كلمة مرور التطبيق (بلا قاعدة بيانات)."""
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        TXT, MUT, GOLD = t["text"], t["muted"], t["accent"]
+        acct = self.cloud_account()
+        win = tk.Toplevel(self.root)
+        try:
+            win.title("المزامنة عبر بريدك")
+            win.configure(bg=BG)
+            win.transient(self.root)
+            win.resizable(False, False)
+            w, h = 560, 470
+            sw, sh = self._screen_size()
+            win.geometry("{}x{}+{}+{}".format(w, h, max(0, (sw - w) // 2),
+                                              max(0, (sh - h) // 3)))
+            win.grab_set()
+        except Exception:
+            pass
+
+        tk.Label(win, text="☁  المزامنة عبر بريدك",
+                 bg=BG, fg=GOLD, font=("Segoe UI", 15, "bold")).pack(pady=(14, 2))
+        tk.Label(win, text=("سجّل ببريدك لاسترجاع محفظتك على هذا الجهاز"
+                            if from_login else
+                            "نسخة مشفّرة داخل بريدك — بلا قاعدة بيانات ولا رابط"),
+                 bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(pady=(0, 8))
+
+        body = tk.Frame(win, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        body.pack(fill="both", expand=True, padx=14, pady=6)
+
+        def fld(label, var, secret=False):
+            tk.Label(body, text=label, bg=CARD, fg=MUT,
+                     font=("Segoe UI", 10), anchor="e").pack(fill="x", padx=16, pady=(10, 2))
+            e = tk.Entry(body, textvariable=var, justify="left",
+                         bg=t.get("entry_bg", "#151a23"), fg=TXT,
+                         insertbackground=TXT, relief="flat", bd=0,
+                         highlightthickness=1, highlightbackground=t.get("border", "#252c39"),
+                         highlightcolor=GOLD, font=("Segoe UI", 10))
+            if secret:
+                e.configure(show="•")
+            e.pack(fill="x", padx=16, ipady=5)
+            return e
+
+        v_mail = tk.StringVar(value=acct.get("email", "") or
+                              (self.cloud_conf().get("last_email") or ""))
+        v_pw = tk.StringVar(value="")
+        fld("البريد الإلكتروني (Gmail)", v_mail)
+        fld("كلمة مرور التطبيق (16 حرفاً)", v_pw, secret=True)
+
+        lbl = tk.Label(body, text="", bg=CARD, fg=MUT, wraplength=500,
+                       justify="right", font=("Segoe UI", 10))
+        lbl.pack(fill="x", padx=16, pady=(10, 2))
+        tk.Label(body, text=("كلمة مرور التطبيق ليست كلمة مرور حسابك. يجب أولاً تفعيل "
+                             "«التحقق بخطوتين» في حساب Google، وبعدها فقط تظهر صفحة "
+                             "كلمات مرور التطبيقات. إن ظهرت رسالة "
+                             "\"The setting you are looking for is not available\" "
+                             "فمعناها أن التحقق بخطوتين غير مفعّل (أو الحساب يديره عمل/مدرسة)."),
+                 bg=CARD, fg=MUT, wraplength=500, justify="right",
+                 font=("Segoe UI", 10)).pack(fill="x", padx=16, pady=(0, 4))
+        self._mkbtn(body, "طريقة الحصول عليها", lambda: webbrowser.open(
+            "https://myaccount.google.com/apppasswords"), kind="ghost",
+            font_size=10).pack(anchor="e", padx=14, pady=(0, 8))
+
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=14, pady=(4, 12))
+        btns = []
+
+        def run(mode):
+            for b in btns:
+                try:
+                    b.config(state="disabled")
+                except Exception:
+                    pass
+            lbl.config(text="جارٍ الاتصال ببريدك…", fg=GOLD)
+            try:
+                win.update_idletasks()
+            except Exception:
+                pass
+            email = v_mail.get().strip()
+            pw = "".join(v_pw.get().split())
+            try:
+                gmail_check(email, pw)
+                info = {"provider": "gmail", "email": email,
+                        "gmail_pw": self._pw_wrap(pw)}
+                if from_login or mode == "pull":
+                    name = self.cloud_login_device(info, pw)
+                    got = False
+                    try:
+                        got = self.cloud_download_to_file(name)
+                    except CloudError as e:
+                        lbl.config(text="تم الدخول لكن تعذّر التنزيل: {}".format(e),
+                                   fg=t.get("loss", "#ff6b6b"))
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    self._finish_login(name)
+                    self.cloud_status("☁ مرحباً {} — {}".format(
+                        email, "تم استرجاع بياناتك" if got
+                        else "لا نسخة في البريد بعد، سيُرفع ما على هذا الجهاز"), "ok")
+                else:
+                    old = self.cloud_account()
+                    same = (str(old.get("email", "")).strip().lower() == email.lower())
+                    self.cloud_update_account(
+                        self.user, provider="gmail", email=email,
+                        gmail_pw=self._pw_wrap(pw),
+                        rev=int(old.get("rev") or 0) if same else 0,
+                        last_hash=old.get("last_hash", "") if same else "")
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    self.cloud_sync_now(True)
+                    try:
+                        self.open_settings()
+                    except Exception:
+                        pass
+            except CloudError as e:
+                lbl.config(text=str(e), fg=t.get("loss", "#ff6b6b"))
+                for b in btns:
+                    try:
+                        b.config(state="normal")
+                    except Exception:
+                        pass
+            except Exception as e:
+                lbl.config(text="خطأ غير متوقع: {}".format(e),
+                           fg=t.get("loss", "#ff6b6b"))
+                for b in btns:
+                    try:
+                        b.config(state="normal")
+                    except Exception:
+                        pass
+
+        btns.append(self._mkbtn(bar, "دخول واسترجاع", lambda: run("pull"),
+                                kind="primary", font_size=11))
+        btns[-1].pack(side="right", padx=4)
+        btns.append(self._mkbtn(bar, "إرسال بيانات هذا الجهاز", lambda: run("push"),
+                                kind="neutral", font_size=10))
+        btns[-1].pack(side="right", padx=4)
+        btns.append(self._mkbtn(bar, "إلغاء", win.destroy, kind="ghost", font_size=10))
+        btns[-1].pack(side="left", padx=4)
+        def _pocket_here():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            self.pocket_export(win)
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+        self._mkbtn(win, "أو 📦 نسخة بملف واحد (بلا بريد ولا كلمة مرور)",
+                    _pocket_here, kind="ghost", font_size=10).pack(pady=(0, 4))
+
+    def open_cloud_dialog(self, from_login=False):
+        """نافذة ربط الحساب: بالبريد (Gmail) افتراضياً، أو Firebase إن كان مضمّناً."""
+        if not self.cloud_builtin():
+            return self.open_gmail_dialog(from_login)
+        """نافذة ربط الحساب السحابي / استرجاع البيانات من جهاز آخر."""
+        t = self.theme
+        BG, CARD = t["bg"], t["card"]
+        TXT, MUT, GOLD = t["text"], t["muted"], t["accent"]
+        conf = self.cloud_conf()
+        acct = self.cloud_account()
+        win = tk.Toplevel(self.root)
+        try:
+            win.title("المزامنة السحابية")
+            win.configure(bg=BG)
+            win.transient(self.root)
+            win.resizable(False, False)
+            w, h = 560, 520
+            sw, sh = self._screen_size()
+            win.geometry("{}x{}+{}+{}".format(w, h, max(0, (sw - w) // 2),
+                                               max(0, (sh - h) // 3)))
+            win.grab_set()
+        except Exception:
+            pass
+
+        tk.Label(win, text=("☁  دخول بالبريد" if from_login else "☁  المزامنة السحابية"),
+                 bg=BG, fg=GOLD, font=("Segoe UI", 15, "bold")).pack(pady=(14, 2))
+        tk.Label(win, text=("أدخل بريدك وكلمة المرور — تُسترجع محفظتك تلقائياً على أي جهاز"
+                            if from_login else
+                            "اربط جهازك ببريدك لتُحدَّث بياناتك تلقائياً"),
+                 bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(pady=(0, 8))
+
+        body = tk.Frame(win, bg=CARD, highlightthickness=1,
+                        highlightbackground=t.get("border", "#252c39"))
+        body.pack(fill="both", expand=True, padx=14, pady=6)
+
+        def fld(parent, label, var, secret=False):
+            tk.Label(parent, text=label, bg=CARD, fg=MUT,
+                     font=("Segoe UI", 10), anchor="e").pack(fill="x", padx=16, pady=(8, 2))
+            e = tk.Entry(parent, textvariable=var, justify="left",
+                         bg=t.get("entry_bg", "#151a23"), fg=TXT,
+                         insertbackground=TXT, relief="flat", bd=0,
+                         highlightthickness=1, highlightbackground=t.get("border", "#252c39"),
+                         highlightcolor=GOLD, font=("Segoe UI", 10))
+            if secret:
+                e.configure(show="•")
+            e.pack(fill="x", padx=16, ipady=5)
+            return e
+
+        builtin = self.cloud_builtin()
+        srv_url, srv_key = self.cloud_server()
+
+        v_mail = tk.StringVar(value=acct.get("email", "") or
+                              (self.cloud_conf().get("last_email") or ""))
+        v_pw = tk.StringVar(value="")
+        e_mail = fld(body, "البريد الإلكتروني", v_mail)
+        e_pw = fld(body, "كلمة المرور (٦ أحرف على الأقل)", v_pw, secret=True)
+
+        # حقول الخادم مخفيّة تماماً في الاستخدام العادي (دخول بالبريد فقط)
+        v_url = tk.StringVar(value=srv_url)
+        v_key = tk.StringVar(value=srv_key)
+        adv = tk.Frame(body, bg=CARD)
+
+        def show_adv():
+            fld(adv, "رابط قاعدة البيانات (Database URL)", v_url)
+            fld(adv, "مفتاح الويب (Web API key)", v_key)
+            adv.pack(fill="x")
+            btn_adv.pack_forget()
+
+        lbl = tk.Label(body, text="", bg=CARD, fg=MUT, wraplength=500,
+                       justify="right", font=("Segoe UI", 10))
+        lbl.pack(fill="x", padx=16, pady=(8, 0))
+        tip = ("بياناتك مرتبطة ببريدك: سجّل الدخول من أي جهاز لتجد محفظتك كما هي."
+               if builtin else
+               "أدخل بريدك وكلمة المرور لبدء المزامنة.")
+        tk.Label(body, text=tip, bg=CARD, fg=MUT, wraplength=500, justify="right",
+                 font=("Segoe UI", 10)).pack(fill="x", padx=16, pady=(2, 0))
+        btn_adv = self._mkbtn(body, "⚙ إعداد الخادم", show_adv, kind="ghost",
+                             font_size=10)
+        if not builtin:
+            btn_adv.pack(anchor="e", padx=14, pady=(2, 8))
+        else:
+            tk.Frame(body, bg=CARD, height=6).pack()
+
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=14, pady=(4, 12))
+        btns = []
+
+        def run(mode):
+            for b in btns:
+                try:
+                    b.config(state="disabled")
+                except Exception:
+                    pass
+            lbl.config(text="جارٍ الاتصال بـ Firebase…", fg=GOLD)
+            try:
+                win.update_idletasks()
+            except Exception:
+                pass
+            try:
+                info = self.cloud_auth(v_mail.get(), v_pw.get(), v_url.get(),
+                                       v_key.get(), mode)
+                if from_login:
+                    name = self.cloud_login_device(info, v_pw.get())
+                    got = False
+                    try:
+                        got = self.cloud_download_to_file(name)
+                    except CloudError as e:
+                        lbl.config(text="تم الدخول لكن تعذّر التنزيل: {}".format(e),
+                                   fg=t.get("loss", "#ff6b6b"))
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    self._finish_login(name)
+                    self.cloud_status("☁ مرحباً {} — {}".format(
+                        info.get("email", ""), "تم استرجاع البيانات" if got
+                        else "سيُرفع ما على هذا الجهاز"), "ok")
+                    self.cloud_sync_now(True)
+                else:
+                    old = self.cloud_account()
+                    rev = int(old.get("rev") or 0) if old.get("uid") == info.get("uid") else 0
+                    self.cloud_update_account(
+                        self.user, rev=rev, last_hash=old.get("last_hash", "")
+                        if old.get("uid") == info.get("uid") else "", **info)
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    self.cloud_sync_now(True)
+                    try:
+                        self.open_settings()
+                    except Exception:
+                        pass
+            except CloudError as e:
+                lbl.config(text=str(e), fg=t.get("loss", "#ff6b6b"))
+                for b in btns:
+                    try:
+                        b.config(state="normal")
+                    except Exception:
+                        pass
+            except Exception as e:
+                lbl.config(text="خطأ غير متوقع: {}".format(e),
+                           fg=t.get("loss", "#ff6b6b"))
+                for b in btns:
+                    try:
+                        b.config(state="normal")
+                    except Exception:
+                        pass
+
+        btns.append(self._mkbtn(bar, "دخول", lambda: run("login"),
+                                kind="primary", font_size=11))
+        btns[-1].pack(side="right", padx=4)
+        btns.append(self._mkbtn(bar, "إنشاء حساب بالبريد", lambda: run("register"),
+                                kind="neutral", font_size=10))
+        btns[-1].pack(side="right", padx=4)
+
+        def forgot():
+            lbl.config(text="جارٍ إرسال رابط إعادة التعيين…", fg=GOLD)
+            try:
+                msg = self.cloud_reset_password(v_mail.get())
+                lbl.config(text="✓ " + msg, fg=t.get("profit", "#3ddc97"))
+            except CloudError as e:
+                lbl.config(text=str(e), fg=t.get("loss", "#ff6b6b"))
+            except Exception as e:
+                lbl.config(text="تعذّر الإرسال: {}".format(e),
+                           fg=t.get("loss", "#ff6b6b"))
+
+        btns.append(self._mkbtn(bar, "نسيت كلمة المرور؟", forgot,
+                                kind="ghost", font_size=10))
+        btns[-1].pack(side="left", padx=4)
+        btns.append(self._mkbtn(bar, "إلغاء", win.destroy, kind="ghost", font_size=10))
+        btns[-1].pack(side="left", padx=4)
+
+
     # ============================ التخزين ============================
     def load(self):
         path = getattr(self, "data_file", None) or DATA_FILE
@@ -1289,7 +2532,8 @@ class GoldApp:
         if not getattr(self, "user", None):
             return
         try:
-            with open(self.data_file, "w", encoding="utf-8") as f:
+            tmp = self.data_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({
                     "holdings": self.holdings,
                     "sells": self.sells,
@@ -1314,7 +2558,11 @@ class GoldApp:
                     "widget_on": bool(getattr(self, "_widget_on", False)),
                     "widget_geo": getattr(self, "_widget_geo", ""),
                 }, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.data_file)
             self.auto_backup()
+            self.cloud_touch()
         except Exception:
             pass
 
@@ -1372,7 +2620,9 @@ class GoldApp:
                     os.path.basename(src)), parent=self.root):
             return
         try:
-            shutil.copyfile(src, self.data_file)
+            tmp = self.data_file + ".tmp"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, self.data_file)
         except Exception as e:
             messagebox.showerror("استعادة نسخة", "تعذّرت الاستعادة:\n{}".format(e))
             return
@@ -1459,7 +2709,7 @@ class GoldApp:
             e.pack(fill="x", ipady=6)
             return e
 
-        self.lg_user = field("اسم المستخدم")
+        self.lg_user = field("اسم المستخدم أو البريد")
         self.lg_pw = field("كلمة المرور", secret=True)
         self.lg_pw2 = field("تأكيد كلمة المرور", secret=True) if mode == "register" else None
 
@@ -1487,6 +2737,9 @@ class GoldApp:
         self._mkbtn(inner, alt,
                     lambda: self.show_login("register" if mode == "login" else "login"),
                     kind="ghost", font_size=10).pack(fill="x")
+        self._mkbtn(inner, "☁  الدخول بالبريد واسترجاع بياناتي",
+                    lambda: self.open_cloud_dialog(from_login=True),
+                    kind="ghost", font_size=10).pack(fill="x", pady=(4, 0))
 
         if mode == "register" and os.path.exists(DATA_FILE) and not users:
             tk.Label(inner, text="لديك بيانات محفوظة على هذا الجهاز — ستُربط بحسابك تلقائياً.",
@@ -1535,6 +2788,11 @@ class GoldApp:
         if rec is None:
             for k in users:
                 if k.lower() == name.lower():
+                    name, rec = k, users[k]
+                    break
+        if rec is None and "@" in name:
+            for k in users:
+                if str(users[k].get("email", "")).strip().lower() == name.lower():
                     name, rec = k, users[k]
                     break
         if rec is None or not verify_password(pw, rec.get("salt", ""), rec.get("hash", "")):
@@ -1613,6 +2871,16 @@ class GoldApp:
         self.start_live_refresh()
         if getattr(self, "_widget_on", False):
             self.open_widget()
+        # مزامنة سحابية عند الدخول (استرجاع البيانات على أي جهاز)
+        try:
+            if getattr(self, "_cloud_pulled", False):
+                self._cloud_pulled = False
+                if self.cloud_ready():
+                    self.cloud_update_account(self.user, last_hash=self.cloud_hash())
+            elif self.cloud_ready():
+                self.cloud_sync_now(True)
+        except Exception:
+            pass
 
     def logout(self):
         if not messagebox.askyesno("تسجيل الخروج",
@@ -1620,6 +2888,11 @@ class GoldApp:
                                    parent=self.root):
             return
         self.save()
+        try:
+            if self.cloud_ready() and self.cloud_conf().get("auto", True):
+                self.cloud_push()
+        except Exception:
+            pass
         self._live_on = False
         self.locked = False
         self.close_widget()
@@ -2444,6 +3717,10 @@ class GoldApp:
             self.btn_privacy.pack(side="left", padx=(8, 0))
             self._mkbtn(chip, "🌓", self.toggle_theme, kind="ghost",
                         font_size=10).pack(side="left", padx=(4, 0))
+            self.btn_cloud = self._mkbtn(chip, "☁",
+                                         lambda: self.cloud_sync_now(True),
+                                         kind="ghost", font_size=10)
+            self.btn_cloud.pack(side="left", padx=(4, 0))
             self._mkbtn(chip, "الحساب", self.open_account, kind="ghost",
                         font_size=10).pack(side="left", padx=(4, 0))
             tk.Label(chip, text="👤  " + self.user, bg=BG, fg=TXT,
@@ -4268,6 +5545,57 @@ class GoldApp:
                     font_size=10).pack(side="right", padx=4)
         self._mkbtn(bkfr, "♻ استعادة أحدث نسخة", self.restore_latest_backup,
                     kind="danger", font_size=10).pack(side="right", padx=4)
+
+        tk.Frame(win, bg=t.get("border", "#252c39"), height=1).pack(
+            fill="x", padx=22, pady=(14, 0))
+        clfr = tk.Frame(win, bg=t["bg"])
+        clfr.pack(fill="x", padx=22, pady=(8, 0))
+        tk.Label(clfr, text="☁ المزامنة عبر بريدك", bg=t["bg"], fg=t["accent"],
+                 font=("Segoe UI", 11, "bold")).pack(side="right")
+        acct = self.cloud_account()
+        connected = bool(self.cloud_ready())
+        if connected:
+            ctext = "مرتبط: {}  •  آخر مزامنة: {}".format(
+                acct.get("email", "") or acct.get("sync_name", ""),
+                acct.get("last_sync", "—"))
+            ccolor = t.get("profit", "#3ddc97")
+        else:
+            ctext = ("غير مرتبط — إما البريد (كلمة مرور التطبيق)، أو «نسخة بملف» "
+                     "بدون أي إعداد: ملف واحد تنقله بين أجهزتك.")
+            ccolor = t.get("muted", "#888")
+        self.lbl_cloud = tk.Label(clfr, text=getattr(self, "_cloud_msg", ctext),
+                                  bg=t["bg"], fg=ccolor, anchor="e",
+                                  justify="right", wraplength=430,
+                                  font=("Segoe UI", 10))
+        self.lbl_cloud.pack(fill="x", pady=(2, 0))
+        row_c = tk.Frame(win, bg=t["bg"])
+        row_c.pack(fill="x", padx=22, pady=(6, 0))
+        self._mkbtn(row_c, "🔗 ربط بالبريد", self.open_cloud_dialog,
+                    kind="primary", font_size=10).pack(side="right", padx=3)
+        self._mkbtn(row_c, "⟳ مزامنة الآن", lambda: self.cloud_sync_now(True),
+                    kind="neutral", font_size=10).pack(side="right", padx=3)
+        if connected:
+            self._mkbtn(row_c, "فصل", self.cloud_unlink, kind="danger",
+                        font_size=10).pack(side="left", padx=3)
+        row_p = tk.Frame(win, bg=t["bg"])
+        row_p.pack(fill="x", padx=22, pady=(4, 0))
+        tk.Label(row_p, text="أبسط بديل بلا بريد ولا إعداد:", bg=t["bg"],
+                 fg=t.get("muted"), font=("Segoe UI", 10)).pack(side="right", padx=(0, 8))
+        self._mkbtn(row_p, "📦 حفظ نسخة في ملف", self.pocket_export,
+                    kind="ghost", font_size=10).pack(side="right", padx=3)
+        self._mkbtn(row_p, "📂 استعادة من ملف", self.pocket_import,
+                    kind="neutral", font_size=10).pack(side="right", padx=3)
+        auto_v = tk.BooleanVar(value=bool(self.cloud_conf().get("auto", True)))
+
+        def toggle_auto():
+            conf = self.cloud_conf()
+            conf["auto"] = bool(auto_v.get())
+            self.cloud_store()
+        tk.Checkbutton(row_c, text="تلقائي", variable=auto_v, command=toggle_auto,
+                       bg=t["bg"], fg=t.get("muted"), selectcolor=t.get("card", "#151a23"),
+                       activebackground=t["bg"], activeforeground=t.get("text"),
+                       bd=0, highlightthickness=0, font=("Segoe UI", 10)).pack(
+                           side="left", padx=6)
 
         btnfr = tk.Frame(win, bg=t["bg"])
         btnfr.pack(fill="x", padx=22, pady=(16, 10))
