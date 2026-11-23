@@ -43,7 +43,7 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
-APP_VERSION = "PriceFix-19-Contrast"
+APP_VERSION = "PriceFix-20-NavStates"
 HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
 FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
@@ -3663,6 +3663,9 @@ class GoldApp:
         t = self.theme
         self._nav_buttons = {}
         self._nav_labels = {}
+        self._nav_frames = {}
+        self._nav_indicators = {}
+        self._nav_hover = None
         tk.Label(self.sidebar, text="التنقل", bg=t["card"], fg=t["muted"],
                  font=("Segoe UI", 10)).pack(fill="x", pady=(18, 12))
         items = [("main", "المحفظة", lambda: self._show_page("main")),
@@ -3673,8 +3676,15 @@ class GoldApp:
                  ("settings", "الإعدادات", self.open_settings)]
         self._nav_images = {}
         for key, label, command in items + [("account", "الحساب", self.open_account)]:
-            button = self._mkbtn(self.sidebar, label, command, kind="neutral", font_size=11)
-            button.configure(anchor="e", padx=12, pady=11, bg=t["card"], relief="flat")
+            row = tk.Frame(self.sidebar, bg=t["card2"], highlightthickness=1,
+                           highlightbackground=t["border"])
+            indicator = tk.Frame(row, bg=t["card2"], width=4)
+            indicator.pack(side="right", fill="y")
+            button = self._mkbtn(row, label, command, kind="neutral", font_size=11)
+            button.configure(anchor="e", padx=10, pady=11, bg=t["card2"], relief="flat", highlightthickness=0)
+            button.pack(side="left", fill="both", expand=True)
+            self._nav_frames[key] = row
+            self._nav_indicators[key] = indicator
             try:
                 folder = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
                 mode = "dark" if getattr(self, "dark_mode", True) else "light"
@@ -3684,13 +3694,14 @@ class GoldApp:
             except (tk.TclError, OSError):
                 pass
             if key == "account":
-                button.pack(side="bottom", fill="x", padx=8, pady=16)
+                row.pack(side="bottom", fill="x", padx=8, pady=16)
             else:
-                button.pack(fill="x", padx=8, pady=3)
+                row.pack(fill="x", padx=8, pady=4)
             self._nav_buttons[key] = button
             self._nav_labels[key] = label
+            button.bind("<Enter>", lambda event, k=key: self._set_nav_hover(k, True))
+            button.bind("<Leave>", lambda event, k=key: self._set_nav_hover(k, False))
             self._attach_tooltip(button, label)
-            button.bind("<Leave>", lambda event: self._paint_navigation(getattr(self, "_page", "main")), add="+")
         self.btn_settings = self._nav_buttons["settings"]
         self._sidebar_compact = None
 
@@ -3698,14 +3709,30 @@ class GoldApp:
         t = self.theme
         active = "main" if page in ("addbuy", "sell", "editholding") else page
         for key, button in getattr(self, "_nav_buttons", {}).items():
-            button.configure(bg=t["total_bg"] if key == active else t["card"],
-                             fg=t["accent"] if key == active else t["text"])
+            selected = key == active
+            hovered = key == getattr(self, "_nav_hover", None)
+            bg = t["total_bg"] if selected else (t["border"] if hovered else t["card2"])
+            fg = t["accent"] if selected else t["text"]
+            button.configure(bg=bg, fg=fg, activebackground=bg, activeforeground=fg)
+            row = getattr(self, "_nav_frames", {}).get(key)
+            indicator = getattr(self, "_nav_indicators", {}).get(key)
+            if row is not None:
+                row.configure(bg=bg, highlightbackground=t["accent"] if selected else t["border"])
+            if indicator is not None:
+                indicator.configure(bg=t["accent"] if selected else bg)
         title = getattr(self, "page_title", None)
         if title is not None:
             title.configure(text={"main":"المحفظة", "chart":"المخطط", "history":"سجل العمليات",
                                   "alerts":"التنبيهات", "zakat":"الزكاة", "settings":"الإعدادات",
                                   "account":"الحساب", "addbuy":"إضافة شراء", "sell":"أمر بيع",
                                   "editholding":"تعديل المقتنى"}.get(page, "المحفظة"))
+
+    def _set_nav_hover(self, key, entered):
+        if entered:
+            self._nav_hover = key
+        elif getattr(self, "_nav_hover", None) == key:
+            self._nav_hover = None
+        self._paint_navigation(getattr(self, "_page", "main"))
 
     def _responsive_shell(self, event=None):
         if event is not None and event.widget is not self.app_shell:
