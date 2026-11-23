@@ -43,7 +43,7 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
-APP_VERSION = "PriceFix-18-Sidebar"
+APP_VERSION = "PriceFix-19-Contrast"
 HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
 FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
@@ -471,7 +471,7 @@ LEGACY_LIGHT_THEME = {
     "flash_same": "#b8860b",
     "sold_bg": "#e6f6ec",
 }
-DEFAULT_THEME = {
+PREVIOUS_DARK_THEME = {
     "bg": "#0e1522",
     "card": "#162031",
     "card2": "#1c293c",
@@ -489,6 +489,25 @@ DEFAULT_THEME = {
     "hover": "#e7ca95",
     "flash_same": "#d8b775",
     "sold_bg": "#16312f",
+}
+DEFAULT_THEME = {
+    "bg": "#0B1220",
+    "card": "#162235",
+    "card2": "#213149",
+    "accent": "#E5BF73",
+    "accent_text": "#0B1220",
+    "text": "#F3F6FC",
+    "muted": "#B7C4D8",
+    "profit": "#4ADEA3",
+    "loss": "#FF8793",
+    "total": "#F3F6FC",
+    "total_bg": "#2B4263",
+    "border": "#41536D",
+    "entry_bg": "#213149",
+    "row_alt": "#19283E",
+    "hover": "#F0D49B",
+    "flash_same": "#E5BF73",
+    "sold_bg": "#15372E"
 }
 LIGHT_THEME = {
     "bg": "#f2f5fa",
@@ -3284,7 +3303,8 @@ class GoldApp:
         """Refresh stock colors only; retain all user-customized colors."""
         legacy = LEGACY_DARK_THEME if getattr(self, "dark_mode", True) else LEGACY_LIGHT_THEME
         modern = self._base_theme()
-        return {key: modern.get(key, value) if value == legacy.get(key) else value
+        previous = PREVIOUS_DARK_THEME if getattr(self, "dark_mode", True) else LEGACY_LIGHT_THEME
+        return {key: modern.get(key, value) if value in (legacy.get(key), previous.get(key)) else value
                 for key, value in (saved or {}).items()}
 
     def _attach_tooltip(self, widget, text):
@@ -3801,7 +3821,7 @@ class GoldApp:
                         font=("Segoe UI", 11, "bold"), relief="flat",
                         padding=(p(9), p(8)))
         style.map("Treeview",
-                  background=[("selected", t.get("border", "#2c3a52"))],
+                  background=[("selected", t["total_bg"])],
                   foreground=[("selected", t["text"])])
         style.map("Treeview.Heading",
                   background=[("active", t.get("border", "#252c39"))])
@@ -4009,7 +4029,7 @@ class GoldApp:
         self.tree.tag_configure("totalpos", background=t["total_bg"],
                                 foreground=t["profit"], font=("Segoe UI", 11, "bold"))
         self.tree.tag_configure("totalneg", background=t["total_bg"],
-                                foreground=t["loss"], font=("Segoe UI", 11, "bold"))
+                                foreground=("#FF919D" if t["loss"] == "#FF8793" else t["loss"]), font=("Segoe UI", 11, "bold"))
         self.tree.tag_configure("soldgreen", background=t.get("sold_bg", "#12301f"),
                                 foreground=t["profit"], font=("Segoe UI", 11, "bold"))
         self.tree.pack(side="top", fill="x")
