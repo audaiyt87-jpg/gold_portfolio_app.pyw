@@ -43,7 +43,7 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
-APP_VERSION = "PriceFix-10-CleanStatus"
+APP_VERSION = "PriceFix-16-AutoTable"
 HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
 FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
@@ -897,7 +897,7 @@ class PriceWidget:
     سعر شراء الغرام بالريال السعودي | سعر الشراء بالدينار الأردني |
     القيمة الحالية للمحفظة. يُسحب بالماوس، يحفظ موضعه، ويُغلق بـ ✕ أو F9."""
 
-    WIDTH = 340
+    WIDTH = 380
 
     def __init__(self, app):
         self.app = app
@@ -978,22 +978,23 @@ class PriceWidget:
         tk.Frame(body, bg=self.border, height=1).pack(fill="x",
                                                      pady=(px(2), px(3)))
 
-        # -------- ثلاثة أعمدة بجانب بعضها: شراء ر.س | شراء د.أ | القيمة --------
-        strip = tk.Frame(body, bg=self.card)
-        strip.pack(fill="x")
-        self.v_sar = self._cell(strip, "شراء (ر.س)")
+        # Two rows retain legible values without crowding four columns.
+        strip=tk.Frame(body,bg=self.card);strip.pack(fill="x")
+        self.v_sar=self._cell(strip,"شراء (ر.س)")
         self._vsep(strip)
-        self.v_jod = self._cell(strip, "شراء (د.أ)")
-        self._vsep(strip)
-        self.v_val = self._cell(strip, "القيمة الحالية", color=self.accent,
-                                big=True)
-        self.cols = strip
+        self.v_jod=self._cell(strip,"شراء (د.أ)")
+        tk.Frame(body,bg=self.border,height=1).pack(fill="x",pady=px(4))
+        portfolio=tk.Frame(body,bg=self.card);portfolio.pack(fill="x")
+        self.v_val=self._cell(portfolio,"القيمة الحالية",color=self.accent,big=True)
+        self._vsep(portfolio)
+        self.v_pl=self._cell(portfolio,"الربح/الخسارة غير المحققة",big=True)
+        self.cols=strip
 
     def _cell(self, parent, title, color=None, big=False):
         """عمود صغير: العنوان فوق القيمة، بداخل الشريط الأفقي."""
         px = self.app._px
         fr = tk.Frame(parent, bg=self.card)
-        fr.pack(side="right", padx=px(4), pady=px(1))
+        fr.pack(side="right",fill="both",expand=True,padx=px(4),pady=px(1))
         tk.Label(fr, text=title, bg=self.card, fg=self.muted,
                  font=("Segoe UI", 10)).pack()
         val = tk.Label(fr, text="--", bg=self.card, fg=color or self.text,
@@ -1040,8 +1041,8 @@ class PriceWidget:
             y = e.y_root - self._dy
             sw = self.win.winfo_screenwidth()
             sh = self.win.winfo_screenheight()
-            x = max(-20, min(int(x), sw - 120))
-            y = max(0, min(int(y), sh - 60))
+            x = max(0,min(int(x),max(0,sw-self.win.winfo_width())))
+            y = max(0,min(int(y),max(0,sh-self.win.winfo_height())))
             self.win.geometry("+{}+{}".format(x, y))
             self.app._widget_geo = "+{}+{}".format(x, y)
         except Exception:
@@ -1055,8 +1056,8 @@ class PriceWidget:
                 x, y = int(m.group(1)), int(m.group(2))
                 sw = self.win.winfo_screenwidth()
                 sh = self.win.winfo_screenheight()
-                x = max(-20, min(x, sw - 120))
-                y = max(0, min(y, sh - 60))
+                x = max(0,min(x,max(0,sw-self.win.winfo_width())))
+                y = max(0,min(y,max(0,sh-self.win.winfo_height())))
                 self.win.geometry("+{}+{}".format(x, y))
                 return
             except Exception:
@@ -1080,25 +1081,26 @@ class PriceWidget:
             self.v_sar.config(text="--", fg=self.text)
             self.v_jod.config(text="--", fg=self.text)
             self.v_val.config(text="--")
+            self.v_pl.config(text="--",fg=self.text)
             self.lbl_karat.config(text=str(getattr(self.app, "karat", 24)))
             return
-        prev = getattr(self, "_prev", None) or {}
-        for key, lbl in (("sar", self.v_sar), ("jod", self.v_jod)):
-            cur = d[key]
-            color = self.text
-            if key in prev:
-                if cur["buy"] > prev[key] + 1e-9:
-                    color = self.profit
-                elif cur["buy"] < prev[key] - 1e-9:
-                    color = self.loss
-            lbl.config(text=hide("{:,.3f}".format(cur["buy"])), fg=color)
-        self._prev = {"sar": d["sar"]["buy"], "jod": d["jod"]["buy"]}
+        delta=float(getattr(self.app,"_delta_oz",0) or 0)
+        arrow="↑" if delta>1e-9 else "↓" if delta< -1e-9 else ""
+        private=getattr(self.app,"privacy",False)
+        color=self.text if private else self.profit if arrow=="↑" else self.loss if arrow=="↓" else self.text
+        for key,lbl in (("sar",self.v_sar),("jod",self.v_jod)):
+            value="{} {:,.3f}".format(arrow,d[key]["buy"]).strip()
+            lbl.config(text="•••" if private else hide(value),fg=color)
         try:
-            sym = CUR[self.app.cur]["sym"]
-            val = self.app.portfolio_value_disp()
-            self.v_val.config(text=hide("{}{:,.2f}".format(sym, val)))
+            sym=CUR[self.app.cur]["sym"]
+            val=self.app.portfolio_value_disp()
+            pl=self.app.portfolio_profit_disp()
+            self.v_val.config(text="•••" if private else hide("{}{:,.2f}".format(sym,val)))
+            self.v_pl.config(text="•••" if private else hide("{}{:+,.2f}".format(sym,pl)),
+                             fg=self.text if private else self.profit if pl>1e-9 else self.loss if pl< -1e-9 else self.text)
         except Exception:
             self.v_val.config(text="--")
+            self.v_pl.config(text="--",fg=self.text)
         try:
             self.lbl_karat.config(text=str(getattr(self.app, "karat", 24)))
         except Exception:
@@ -3102,6 +3104,16 @@ class GoldApp:
                 continue
         return total
 
+    def portfolio_profit_disp(self):
+        """Unrealized P/L of remaining holdings, in the portfolio display currency."""
+        cost=0.0
+        for holding in getattr(self,"holdings",[]):
+            try:
+                cost+=float(holding["qty"])*float(holding["buy"])*self.rate()
+            except (KeyError,ValueError,TypeError):
+                continue
+        return self.portfolio_value_disp()-cost
+
     def current_per_unit_disp(self, unit, karat=24):
         """السعر الحالي للوحدة بعيار محدد (الراجحي للبيع إن كانت العملة سعودية، وإلا السوقي)."""
         g = self.gram_eff_disp() * karat_factor(karat)
@@ -3585,23 +3597,23 @@ class GoldApp:
         hdr = tk.Frame(self.root, bg=BG)
         hdr.pack(fill="x", padx=p(22), pady=(p(16), p(4)),
                  before=self.page_holder)
+        hdr.grid_columnconfigure(0,weight=1,uniform="header_sides")
+        hdr.grid_columnconfigure(1,weight=0)
+        hdr.grid_columnconfigure(2,weight=1,uniform="header_sides")
+        brand=tk.Frame(hdr,bg=BG)
+        brand.grid(row=0,column=1)
         try:
             asset_dir=getattr(sys,"_MEIPASS",None) or os.path.dirname(os.path.abspath(__file__))
             self._brand_image=tk.PhotoImage(file=os.path.join(asset_dir,"brand_badge.png"))
-            tk.Label(hdr,image=self._brand_image,bg=BG).pack(side="right",padx=p(8))
+            tk.Label(brand,image=self._brand_image,bg=BG).pack()
             self.root.iconphoto(True,self._brand_image)
         except (tk.TclError,OSError):
             self._brand_image=None
-        compact = (getattr(self, "screen_h", 900) < 800 or
-                   getattr(self, "screen_w", 1400) < 1180)
-        tk.Label(hdr, text=self.titles.get("title"), bg=BG, fg=GOLD,
-                 font=("Segoe UI", 18 if compact else 22, "bold")).pack(side="right")
-        if not compact:
-            tk.Label(hdr, text=self.titles.get("subtitle"), bg=BG, fg=MUT,
-                     font=("Segoe UI", 10)).pack(side="right", padx=p(16))
+        tk.Label(brand,text="محفظة الذهب",bg=BG,fg=GOLD,
+                 font=("Segoe UI",14,"bold")).pack(pady=(2,0))
         if getattr(self, "user", None):
             chip = tk.Frame(hdr, bg=BG)
-            chip.pack(side="left")
+            chip.grid(row=0,column=0,sticky="w")
             self.btn_privacy = self._mkbtn(
                 chip, "👁" if getattr(self, "privacy", False) else "🙈",
                 self.toggle_privacy, kind="ghost", font_size=10)
@@ -3614,6 +3626,8 @@ class GoldApp:
             self.btn_cloud.pack(side="left", padx=(4, 0))
             self._mkbtn(chip, "الحساب", self.open_account, kind="ghost",
                         font_size=10).pack(side="left", padx=(4, 0))
+            self.btn_settings=self._mkbtn(chip,"⚙ الإعدادات",self.open_settings,kind="ghost",font_size=10)
+            self.btn_settings.pack(side="left",padx=(4,0))
             tk.Label(chip, text="👤  " + self.user, bg=BG, fg=TXT,
                      font=("Segoe UI", 11, "bold")).pack(side="left")
         tk.Frame(self.root, bg=t.get("border", "#252c39"),
@@ -3676,8 +3690,6 @@ class GoldApp:
         # ربط تغيير العملة بعد جهوزية عناصر الواجهة كلها
         self.cur_var.trace_add("write", lambda *a: self.on_currency_change())
 
-        self._mkbtn(ctrl, "⚙ الإعدادات", self.open_settings, kind="neutral",
-                    font_size=10).pack(side="left", padx=6)
         self._mkbtn(ctrl, "🧮 حاسبة التكلفة", self.open_calc, kind="neutral",
                     font_size=10).pack(side="left", padx=6)
 
@@ -3715,7 +3727,7 @@ class GoldApp:
         self.lbl_delta.pack(side="right",padx=4)
         self._set_update_caption()
 
-        # شريط الإضافة: زر واحد فقط — تفاصيل العملية تُدخَل في صفحة مستقلة
+        # شريط الإضافة: العمليات
         addbar = tk.Frame(self.main_page, bg=BG)
         addbar.pack(fill="x", padx=p(18), pady=(p(4), p(2)))
         self.btn_add = self._mkbtn(addbar, "＋  إضافة عملية (شراء / بيع)",
@@ -3723,7 +3735,7 @@ class GoldApp:
                                    font_size=12)
         self.btn_add.pack(side="right", pady=2)
         tk.Label(addbar,
-                 text="اختر «شراء» أو «بيع» ثم أدخل الوزن والعيار والسعر في صفحة مستقلة",
+                 text="اختر «شراء» أو «بيع» ثم أدخل الوزن والعيار والسعر",
                  bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(side="right",
                                                             padx=p(10))
         # إظهار/إخفاء صفوف البيع في قائمة العمليات
@@ -3743,12 +3755,10 @@ class GoldApp:
                 "sellprice", "pl", "pct")
         heads = ("الاسم", "الحالة", "الكمية", "سعر الشراء", "التكلفة",
                  "السعر الحالي", "القيمة", "سعر البيع", "الربح/الخسارة", "%")
-        _sh = getattr(self, "screen_h", 900)
-        tree_rows = 9 if _sh <= 768 else (12 if _sh <= 820 else 15)
         tree_wrap = tk.Frame(self.main_page, bg=BG)
-        tree_wrap.pack(fill="both", expand=True, padx=p(18), pady=p(6))
+        tree_wrap.pack(fill="x", padx=p(18), pady=p(6))
         self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
-                                 height=tree_rows)
+                                 height=0)
         for c, h in zip(cols, heads):
             self.tree.heading(c, text=h)
             self.tree.column(c, anchor="center", width=110)
@@ -3771,7 +3781,7 @@ class GoldApp:
                                 foreground=t["loss"], font=("Segoe UI", 11, "bold"))
         self.tree.tag_configure("soldgreen", background=t.get("sold_bg", "#12301f"),
                                 foreground=t["profit"], font=("Segoe UI", 11, "bold"))
-        self.tree.pack(side="top", fill="both", expand=True)
+        self.tree.pack(side="top", fill="x")
         self.tree_x.pack(side="bottom", fill="x", pady=(2, 0))
         # نقر مزدوج على أي عملية شراء => فتح أمر البيع عليها مباشرة
         try:
@@ -6190,6 +6200,10 @@ class GoldApp:
         except Exception:
             pass
 
+    def _fit_operations_table(self):
+        """Keep only visible rows; the page handles scrolling for long lists."""
+        self.tree.configure(height=len(self.tree.get_children()))
+
     def render(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
@@ -6270,6 +6284,7 @@ class GoldApp:
                 "{}{:,.2f}".format(sym, t_val), "-",
                 "{}{}{:,.2f}".format("+" if t_pl > 0 else "", sym, t_pl),
                 "{}{:.2f}%".format("+" if t_pl > 0 else "", t_pct))))
+        self._fit_operations_table()
         self.lbl_sum.config(
             text=self._hide(
                 ("الربح المحقق: {sg_r}{s}{r:,.2f}    |    غير المحقق: {sg_u}{s}{u:,.2f}"
