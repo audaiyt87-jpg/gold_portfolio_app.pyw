@@ -24,10 +24,10 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --collect-data certifi --hidden-import requests --onefile --windowed --name GoldPortfolio-PriceFix-5-LiveSources --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
+          pyinstaller --noconfirm --collect-data certifi --hidden-import requests --hidden-import live_chart --onefile --windowed --name GoldPortfolio-PriceFix-6-LiveChart --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: GoldPortfolio-Windows-EXE
-          path: dist/GoldPortfolio-PriceFix-5-LiveSources.exe
+          path: dist/GoldPortfolio-PriceFix-6-LiveChart.exe
