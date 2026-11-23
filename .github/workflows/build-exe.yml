@@ -24,10 +24,10 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --collect-data certifi --hidden-import requests --hidden-import live_chart --onefile --windowed --name GoldPortfolio-PriceFix-19-Contrast --icon app.ico --add-data "app.ico;." --add-data "brand_badge.png;." --add-data "nav_dark_main.png;." --add-data "nav_dark_chart.png;." --add-data "nav_dark_history.png;." --add-data "nav_dark_alerts.png;." --add-data "nav_dark_zakat.png;." --add-data "nav_dark_settings.png;." --add-data "nav_dark_account.png;." --add-data "nav_light_main.png;." --add-data "nav_light_chart.png;." --add-data "nav_light_history.png;." --add-data "nav_light_alerts.png;." --add-data "nav_light_zakat.png;." --add-data "nav_light_settings.png;." --add-data "nav_light_account.png;." gold_portfolio_app.pyw
+          pyinstaller --noconfirm --collect-data certifi --hidden-import requests --hidden-import live_chart --onefile --windowed --name GoldPortfolio-PriceFix-20-NavStates --icon app.ico --add-data "app.ico;." --add-data "brand_badge.png;." --add-data "nav_dark_main.png;." --add-data "nav_dark_chart.png;." --add-data "nav_dark_history.png;." --add-data "nav_dark_alerts.png;." --add-data "nav_dark_zakat.png;." --add-data "nav_dark_settings.png;." --add-data "nav_dark_account.png;." --add-data "nav_light_main.png;." --add-data "nav_light_chart.png;." --add-data "nav_light_history.png;." --add-data "nav_light_alerts.png;." --add-data "nav_light_zakat.png;." --add-data "nav_light_settings.png;." --add-data "nav_light_account.png;." gold_portfolio_app.pyw
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: GoldPortfolio-Windows-EXE
-          path: dist/GoldPortfolio-PriceFix-19-Contrast.exe
+          path: dist/GoldPortfolio-PriceFix-20-NavStates.exe
