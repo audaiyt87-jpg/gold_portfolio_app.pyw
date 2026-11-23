@@ -24,10 +24,10 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --collect-data certifi --hidden-import requests --hidden-import live_chart --onefile --windowed --name GoldPortfolio-PriceFix-16-AutoTable --icon app.ico --add-data "app.ico;." --add-data "brand_badge.png;." gold_portfolio_app.pyw
+          pyinstaller --noconfirm --collect-data certifi --hidden-import requests --hidden-import live_chart --onefile --windowed --name GoldPortfolio-PriceFix-17-ModernUI --icon app.ico --add-data "app.ico;." --add-data "brand_badge.png;." gold_portfolio_app.pyw
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: GoldPortfolio-Windows-EXE
-          path: dist/GoldPortfolio-PriceFix-16-AutoTable.exe
+          path: dist/GoldPortfolio-PriceFix-17-ModernUI.exe
