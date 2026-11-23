@@ -9,9 +9,9 @@ if not errorlevel 1 set "PY=py -3"
 if errorlevel 1 goto failed
 %PY% -m pip install -r requirements.txt
 if errorlevel 1 goto failed
-%PY% -m PyInstaller --noconfirm --collect-data certifi --hidden-import requests --onefile --windowed --name GoldPortfolio-PriceFix-5-LiveSources --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
+%PY% -m PyInstaller --noconfirm --collect-data certifi --hidden-import requests --hidden-import live_chart --onefile --windowed --name GoldPortfolio-PriceFix-6-LiveChart --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
 if errorlevel 1 goto failed
-echo Done: dist\GoldPortfolio-PriceFix-5-LiveSources.exe
+echo Done: dist\GoldPortfolio-PriceFix-6-LiveChart.exe
 pause
 popd
 exit /b 0

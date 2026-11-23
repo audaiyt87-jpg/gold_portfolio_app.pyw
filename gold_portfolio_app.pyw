@@ -18,6 +18,7 @@ try:
 except ImportError:
     requests = None
 import math
+from live_chart import clean_points, render_chart, hover_chart
 import re
 import sys
 import glob
@@ -41,7 +42,7 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
-APP_VERSION = "PriceFix-5-LiveSources"
+APP_VERSION = "PriceFix-6-LiveChart"
 HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
 FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
@@ -415,7 +416,9 @@ UNIT_REV = {"g": "غرام", "oz": "أونصة"}
 KARATS = (24, 22, 21, 18)
 
 # النطاقات الزمنية للمخطط: (المفتاح، الاسم، عدد الثواني)
-CHART_RANGES = (("hour", "ساعة", 3600),
+CHART_RANGES = (("live", "دقيقة", 60),
+                ("quarter", "١٥ دقيقة", 900),
+                ("hour", "ساعة", 3600),
                 ("day", "يوم", 86400),
                 ("week", "أسبوع", 7 * 86400))
 
@@ -1660,7 +1663,10 @@ class GoldApp:
         self.rates = dict(DEFAULT_RATES)
         self.cur = "USD"
         self.karat = 24             # العيار الافتراضي للعرض والاحتماب
-        self.chart_range = "day"    # النطاق الزمني للمخطط: hour / day / week
+        self.chart_range = "live"    # النطاق الزمني للمخطط: hour / day / week
+        self.chart_metric = "ounce"
+        self._live_chart_views = []
+        self._chart_widgets = []
         self._pages = {}            # الصفحات الداخلية المفتوحة (زكاة، سجل، تنبيه، إعدادات، بيع)
         self._closing_page = False
         self.adjust = 5.22          # فرق الراجحي للبيع (يُطرح من سعر الغرام)
@@ -2731,8 +2737,11 @@ class GoldApp:
                 self.karat = int(d.get("karat", 24))
             except (TypeError, ValueError):
                 self.karat = 24
-            cr = d.get("chart_range", "day")
-            self.chart_range = cr if cr in ("hour", "day", "week") else "day"
+            cr = d.get("chart_range", "live")
+            self.chart_range = cr if d.get("live_chart_version") == 1 and cr in {r[0] for r in CHART_RANGES} else "live"
+            self.chart_metric = d.get("chart_metric", "ounce")
+            if self.chart_metric not in ("ounce", "gram"):
+                self.chart_metric = "ounce"
             self.adjust = float(d.get("adjust", 5.22))
             self.buy_margin = float(d.get("buy_margin", 0.0))
             self.alerts = d.get("alerts", [])
@@ -2770,10 +2779,12 @@ class GoldApp:
                     "holdings": self.holdings,
                     "sells": self.sells,
                     "history": self.history,
-                    "price_hist": self.price_hist[-500:],
+                    "price_hist": self.price_hist[-12000:],
                     "cur": self.cur,
                     "karat": self.karat,
                     "chart_range": self.chart_range,
+                    "chart_metric": self.chart_metric,
+                    "live_chart_version": 1,
                     "adjust": self.adjust,
                     "buy_margin": self.buy_margin,
                     "alerts": self.alerts,
@@ -2882,7 +2893,7 @@ class GoldApp:
         self.titles = dict(DEFAULT_TITLES)
         self.cur = "USD"
         self.karat = 24
-        self.chart_range = "day"
+        self.chart_range = "live"
         self.adjust = 5.22
         self.buy_margin = 0.0
         self.sound_on = True
@@ -2895,6 +2906,7 @@ class GoldApp:
         self._fails = 0
         self.al_win = None
         self.row_map = {}
+        self.chart_metric = "ounce"
         self._pages = {}
         self._page = "main"
 
@@ -3888,6 +3900,8 @@ class GoldApp:
         self.root.minsize(880, 560)
 
     def build_ui(self):
+        self._live_chart_views = []
+        self._chart_widgets = []
         t = self.theme
         BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
         GOLD, ATXT, TXT, MUT = t["accent"], t["accent_text"], t["text"], t["muted"]
@@ -4037,6 +4051,8 @@ class GoldApp:
         self.rajhi_note = tk.Label(
             ctrl, text="ℹ أسعار الراجحي متاحة بالريال السعودي فقط",
             bg=BG, fg=MUT, font=("Segoe UI", 10))
+
+        self._create_live_chart(self.main_page, compact=True)
 
         # لوحة ملخص سريعة (تُقرأ بنظرة واحدة)
         dash = tk.Frame(self.main_page, bg=BG)
@@ -5040,86 +5056,67 @@ class GoldApp:
 
     # ============================ مخطط سعر الغرام ============================
     def _record_price_sample(self, oz_usd):
-        """يحفظ عينة سعر: كل ١٥ ثانية كحدّ أقصى لآخر 24 ساعة، وعينة/5 دقائق حتى أسبوع."""
-        try:
-            now = time.time()
-            val = float(oz_usd)
-            if self.price_hist:
-                try:
-                    last_ts = float(self.price_hist[-1][0])
-                except Exception:
-                    last_ts = 0.0
-                if now - last_ts < 15:
-                    # نحدّث آخر نقطة بدل إضافة نقطة كل ٥ ثوانٍ (يمنع امتلاء السجل)
-                    self.price_hist[-1] = [now, val]
-                    return
-            self.price_hist.append([now, val])
-            keep_from = now - 7 * 86400
-            day_ago = now - 86400
-            recent, older = [], []
-            for ts, oz in self.price_hist:
-                if ts < keep_from:
-                    continue
-                if ts >= day_ago:
-                    recent.append([ts, oz])
-                else:
-                    older.append([ts, oz])
-            # تخفيف الأقدم من 24 ساعة: عينة واحدة لكل 5 دقائق
-            thinned, bucket = [], None
-            for ts, oz in older:
-                b = int(ts // 300)
-                if b != bucket:
-                    thinned.append([ts, oz])
-                    bucket = b
-                else:
-                    thinned[-1] = [ts, oz]
-            self.price_hist = (thinned + recent)[-9000:]
-        except Exception:
-            pass
+        """Append every accepted quote, including unchanged prices; never overwrite it."""
+        now = time.time()
+        val = _valid_price(oz_usd)
+        points = clean_points(self.price_hist, now, 7*86400)
+        if points and now-points[-1][0] < 0.5:
+            return
+        points.append((now, val))
+        # Keep two hours at full cadence; compact older history by 5-minute bins.
+        recent, older = [], {}
+        for ts, value in points:
+            if ts >= now-7200:
+                recent.append([ts, value])
+            else:
+                older[int(ts//300)] = [ts, value]
+        self.price_hist = (list(older.values()) + recent)[-12000:]
 
-    # ============================ صفحة المخطط ============================
-    def _build_chart_page(self):
+    def _create_live_chart(self, parent, compact=False):
         t = self.theme
-        BG, CARD = t["bg"], t["card"]
-        GOLD, MUT = t["accent"], t["muted"]
-        px = self._px
-        head = tk.Frame(self.chart_page, bg=BG)
-        head.pack(fill="x", padx=px(24), pady=(px(14), px(8)))
-        tk.Label(head, text="📈 مخطط سعر الغرام", bg=BG, fg=GOLD,
-                 font=("Segoe UI", 16, "bold")).pack(side="right")
-        self._mkbtn(head, "🏠 الرئيسية", lambda: self._show_page("main"),
-                    kind="ghost", font_size=10).pack(side="left")
-        tk.Label(head, text="يتحدّث تلقائياً مع كل تحديث للسعر",
-                 bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(side="left", padx=12)
-        tk.Frame(self.chart_page, bg=t.get("border", "#252c39"),
-                 height=1).pack(fill="x", padx=px(22))
-
-        rng = tk.Frame(self.chart_page, bg=BG)
-        rng.pack(fill="x", padx=px(24), pady=(px(10), 0))
-        tk.Label(rng, text="النطاق الزمني:", bg=BG, fg=MUT,
-                 font=("Segoe UI", 10)).pack(side="right", padx=(8, 6))
-        self._range_btns = {}
-        for key, label, _secs in CHART_RANGES:
-            b = tk.Label(rng, text=label, bg=t.get("card2", CARD), fg=MUT,
-                         padx=18, pady=4, cursor="hand2",
-                         highlightthickness=1,
-                         highlightbackground=t.get("border", "#252c39"),
-                         font=("Segoe UI", 11, "bold"))
-            b.pack(side="right", padx=4)
-            b.bind("<Button-1>", lambda e, k=key: self._set_chart_range(k))
-            self._range_btns[key] = b
-
-        self.chart_info = tk.Label(self.chart_page, text="", bg=BG, fg=MUT,
-                                   font=("Segoe UI", 11, "bold"))
-        self.chart_info.pack(anchor="e", padx=26, pady=(10, 4))
+        outer = tk.Frame(parent, bg=t["card"], highlightthickness=1,
+                         highlightbackground=t.get("border", "#252c39"))
+        outer.pack(fill="x" if compact else "both", expand=not compact,
+                   padx=self._px(18), pady=self._px(8))
+        head = tk.Frame(outer, bg=t["card"])
+        head.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(head, text="● Live Chart — رسم السعر اللحظي", bg=t["card"],
+                 fg=t["accent"], font=("Segoe UI", 13, "bold")).pack(side="right")
+        if compact:
+            self._mkbtn(head, "⛶ تكبير", self.show_chart, kind="ghost", font_size=10).pack(side="left")
+        else:
+            self._mkbtn(head, "🏠 الرئيسية", lambda: self._show_page("main"),
+                        kind="ghost", font_size=10).pack(side="left")
+        controls = tk.Frame(outer, bg=t["card"])
+        controls.pack(fill="x", padx=12, pady=3)
+        for metric, title in (("ounce", "الأونصة"), ("gram", "الغرام")):
+            button = tk.Label(controls, text=title, padx=8, pady=4, cursor="hand2",
+                              bg=t.get("card2", t["card"]), fg=t["muted"], font=("Segoe UI", 10))
+            button.pack(side="right", padx=2)
+            button.bind("<Button-1>", lambda e, k=metric: self._set_chart_metric(k))
+            self._chart_widgets.append((button, "metric", metric))
+        for key, title, seconds in CHART_RANGES:
+            button = tk.Label(controls, text=title, padx=7, pady=4, cursor="hand2",
+                              bg=t.get("card2", t["card"]), fg=t["muted"], font=("Segoe UI", 10))
+            button.pack(side="left", padx=2)
+            button.bind("<Button-1>", lambda e, k=key: self._set_chart_range(k))
+            self._chart_widgets.append((button, "range", key))
+        info = tk.Label(outer, text="بانتظار السعر…", bg=t["card"], fg=t["muted"],
+                        anchor="e", justify="right", font=("Segoe UI", 10))
+        info.pack(fill="x", padx=12, pady=3)
+        canvas = tk.Canvas(outer, bg=t["card"], height=self._px(230 if compact else 430),
+                           highlightthickness=0)
+        canvas.pack(fill="both", expand=not compact, padx=8, pady=(2, 8))
+        view = {"canvas": canvas, "info": info, "layout": None, "compact": compact}
+        self._live_chart_views.append(view)
+        canvas.bind("<Configure>", lambda e: self.draw_chart())
+        canvas.bind("<Motion>", lambda e, v=view: hover_chart(v["canvas"], v["layout"], e, self.theme))
+        canvas.bind("<Leave>", lambda e, c=canvas: c.delete("hover"))
         self._paint_range_buttons()
+        return view
 
-        wrap = tk.Frame(self.chart_page, bg=CARD, highlightthickness=1,
-                        highlightbackground=t.get("border", "#252c39"))
-        wrap.pack(fill="both", expand=True, padx=20, pady=(4, 14))
-        self.chart_canvas = tk.Canvas(wrap, bg=CARD, highlightthickness=0)
-        self.chart_canvas.pack(fill="both", expand=True, padx=8, pady=8)
-        self.chart_canvas.bind("<Configure>", lambda e: self.draw_chart())
+    def _build_chart_page(self):
+        self._create_live_chart(self.chart_page, compact=False)
 
     # ------------------------- التنقل بين الصفحات -------------------------
     def _all_pages(self):
@@ -5261,153 +5258,72 @@ class GoldApp:
         self._show_page("chart")
 
     def _set_chart_range(self, key):
-        if key not in ("hour", "day", "week") or key == self.chart_range:
+        if key not in {r[0] for r in CHART_RANGES} or key == self.chart_range:
             return
         self.chart_range = key
         self.save()
         self._paint_range_buttons()
         self.draw_chart()
 
+    def _set_chart_metric(self, metric):
+        if metric not in ("ounce", "gram"):
+            return
+        self.chart_metric = metric
+        self.save()
+        self._paint_range_buttons()
+        self.draw_chart()
+
     def _paint_range_buttons(self):
-        """تلوين زر النطاق النشط."""
-        t = self.theme
-        for key, btn in getattr(self, "_range_btns", {}).items():
-            active = (key == self.chart_range)
+        for widget, kind, key in getattr(self, "_chart_widgets", []):
+            selected = key == (self.chart_metric if kind == "metric" else self.chart_range)
             try:
-                btn.config(bg=t["accent"] if active else t.get("card2", t["card"]),
-                           fg=t.get("accent_text", "#000") if active else t["muted"])
-            except Exception:
+                widget.config(bg=self.theme["accent"] if selected else self.theme.get("card2", self.theme["card"]),
+                              fg=self.theme.get("accent_text", "#000") if selected else self.theme["muted"])
+            except tk.TclError:
                 pass
 
     def _range_seconds(self):
-        for key, _label, secs in CHART_RANGES:
-            if key == self.chart_range:
-                return secs
-        return 86400
+        return next((r[2] for r in CHART_RANGES if r[0] == self.chart_range), 60)
 
     def _range_label(self):
-        for key, label, _secs in CHART_RANGES:
-            if key == self.chart_range:
-                return label
-        return "يوم"
+        return next((r[1] for r in CHART_RANGES if r[0] == self.chart_range), "دقيقة")
+
+    def _chart_factor(self):
+        return self.rate() if self.chart_metric == "ounce" else self.rate()*karat_factor(self.karat)/OZ_TO_G
 
     def _chart_points(self):
-        """نقاط النطاق المختار (وقت، سعر الغرام) بعيار وعملة العرض الحاليين."""
-        now = time.time()
-        cutoff = now - self._range_seconds()
-        rate = self.rate()
-        kf = karat_factor(self.karat)
-        pts = [(ts, (oz / OZ_TO_G) * rate * kf) for ts, oz in self.price_hist
-               if ts >= cutoff]
-        # تخفيف نقاط الرسم للنطاقات الطويلة (مع الإبقاء على أول وآخر نقطة)
-        if len(pts) > 500:
-            step = len(pts) // 500 + 1
-            pts = pts[::step] + [pts[-1]]
-        return pts
-
-    def _fmt_tick(self, ts):
-        d = datetime.fromtimestamp(ts)
-        if self.chart_range == "week":
-            return d.strftime("%m-%d\n%H:%M")
-        return d.strftime("%H:%M")
+        return clean_points(self.price_hist, time.time(), self._range_seconds(), self._chart_factor())
 
     def draw_chart(self):
-        """يرسم المخطط على صفحة المخطط (يُستدعى عند العرض وعند كل تحديث سعر)."""
-        cv = getattr(self, "chart_canvas", None)
-        if cv is None:
-            return
-        t = self.theme
-        CARD = t["card"]
-        GOLD, MUT = t["accent"], t["muted"]
+        now = time.time()
+        points = clean_points(self.price_hist, now, self._range_seconds(), self._chart_factor())
         sym = CUR[self.cur]["sym"]
-        try:
-            cv.delete("all")
-            W = cv.winfo_width() or 900
-            H = cv.winfo_height() or 430
-            if W < 260:
-                W = 900
-            if H < 180:
-                H = 430
-            pts = self._chart_points()
-            if len(pts) < 2:
-                cv.create_text(W // 2, H // 2,
-                               text=("لا توجد بيانات كافية في نطاق «{}».\n"
-                                     "اترك البرنامج مفتوحاً ليجمّع الأسعار تلقائياً.").format(
-                                         self._range_label()),
-                               fill=MUT, font=("Segoe UI", 12), justify="center")
-                pf = getattr(self, "chart_info", None)
-                if pf is not None:
-                    pf.config(text="عدد العينات في هذا النطاق: {}".format(len(pts)), fg=MUT)
-                return
-            pl, pr, pt, pb = 82, 26, 26, 46
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            xmin, xmax = min(xs), max(xs)
-            ymin, ymax = min(ys), max(ys)
-            if ymax - ymin < 1e-9:
-                ymin -= 1
-                ymax += 1
-            pad = (ymax - ymin) * 0.1
-            ymin -= pad
-            ymax += pad
-
-            def X(x):
-                return (pl + (x - xmin) / (xmax - xmin) * (W - pl - pr)
-                        if xmax > xmin else pl)
-
-            def Y(y):
-                return pt + (ymax - y) / (ymax - ymin) * (H - pt - pb)
-
-            for i in range(5):
-                yy = ymin + (ymax - ymin) * i / 4
-                y = Y(yy)
-                cv.create_line(pl, y, W - pr, y, fill=t.get("border", "#252c39"))
-                cv.create_text(pl - 8, y, text="{:,.1f}".format(yy), fill=MUT,
-                               anchor="e", font=("Segoe UI", 10))
-            # علامات زمنية على المحور الأفقي
-            fracs = [0.0, 0.5, 1.0] if self.chart_range == "hour" \
-                else [0.0, 0.25, 0.5, 0.75, 1.0]
-            for frac in fracs:
-                if frac == 0.0:
-                    anchor = "w"
-                elif frac == 1.0:
-                    anchor = "e"
+        metric = "الأونصة" if self.chart_metric == "ounce" else "الغرام • عيار {}".format(self.karat)
+        unit = "XAU / {} / {}".format(self.cur, "OZ" if self.chart_metric == "ounce" else "GRAM {}K".format(self.karat))
+        for view in getattr(self, "_live_chart_views", []):
+            canvas = view["canvas"]
+            try:
+                if not canvas.winfo_exists() or not canvas.winfo_ismapped():
+                    continue
+                view["layout"] = render_chart(canvas, points, now, self._range_seconds(), self.theme,
+                                               unit, getattr(self, "privacy", False))
+                if getattr(self, "privacy", False):
+                    summary = "وضع الخصوصية — الرسم والسعر مخفيان"
+                elif points:
+                    change = points[-1][1]-points[0][1]
+                    summary = "{} • {} • الآن {}{:,.3f} • التغير {:+.3f} • {} عينات • جلب {}".format(
+                        self._range_label(), metric, sym, points[-1][1], change, len(points), self.last_update or "—")
+                    age = max(0, now-points[-1][0])
+                    if age > 15:
+                        summary += " • لا توجد عينة حديثة منذ {:.0f} ثانية".format(age)
                 else:
-                    anchor = "center"
-                ts = xmin + (xmax - xmin) * frac
-                x = pl + (W - pl - pr) * frac
-                cv.create_text(x, H - pb + 16, text=self._fmt_tick(ts), fill=MUT,
-                               anchor=anchor, font=("Segoe UI", 11),
-                               justify="center")
-            cv.create_text(W - pr, pt - 10, text="({})".format(sym), fill=MUT,
-                           anchor="e", font=("Segoe UI", 10))
-
-            coords = []
-            for x, y in pts:
-                coords += [X(x), Y(y)]
-            up = ys[-1] >= ys[0]
-            line_col = t.get("profit", "#2ecc71") if up else t.get("loss", "#ff5c5c")
-            cv.create_line(*coords, fill=line_col, width=2, smooth=True)
-            cv.create_oval(X(xs[-1]) - 4, Y(ys[-1]) - 4,
-                           X(xs[-1]) + 4, Y(ys[-1]) + 4,
-                           fill=line_col, outline="")
-
-            change = ys[-1] - ys[0]
-            pct = (change / ys[0] * 100) if ys[0] else 0
-            info = ("{rg}  •  عيار {k}  •  الافتتاح: {s}{o:,.2f}  •  الآن: {s}{c:,.2f}  •  "
-                    "التغيّر: {s}{sg}{d:,.2f} ({sg}{p:.2f}%)  •  آخر تحديث: {u}").format(
-                rg=self._range_label(), k=self.karat, s=sym, o=ys[0], c=ys[-1],
-                d=change, p=pct, sg="+" if change > 0 else "",
-                u=self.last_update or "--:--:--")
-            lbl = getattr(self, "chart_info", None)
-            if lbl is not None:
-                lbl.config(text=info, fg=line_col)
-        except Exception:
-            pass
+                    summary = "بانتظار تسعير حديث • محاولة جلب كل ٥ ثوانٍ • لا تُنشأ أسعار مصطنعة"
+                view["info"].config(text=summary, wraplength=max(200, canvas.winfo_width()-24))
+            except tk.TclError as exc:
+                self._live_error = str(exc)[:160]
 
     def _refresh_chart_if_visible(self):
-        if getattr(self, "_page", "main") == "chart":
-            self.draw_chart()
+        self.draw_chart()
 
     # ============================ التنبيهات ============================
     def open_alerts(self):
@@ -5989,6 +5905,8 @@ class GoldApp:
         # Schedule from a monotonic deadline, independent of fetch completion.
         self._live_due = now + self.refresh_interval() / 1000.0
         try:
+            if getattr(self, "_live_chart_views", []):
+                self.draw_chart()
             self.refresh_all()
         except Exception as exc:
             self._live_error = str(exc)[:160]
