@@ -43,7 +43,7 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
-APP_VERSION = "PriceFix-16-AutoTable"
+APP_VERSION = "PriceFix-17-ModernUI"
 HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
 FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
@@ -433,7 +433,7 @@ def karat_factor(karat):
         k = 24.0
     return k / 24.0
 
-DEFAULT_THEME = {
+LEGACY_DARK_THEME = {
     "bg": "#0a0c11",
     "card": "#12161e",
     "card2": "#1a2029",
@@ -452,7 +452,7 @@ DEFAULT_THEME = {
     "flash_same": "#ffd93b",
     "sold_bg": "#12301f",
 }
-LIGHT_THEME = {
+LEGACY_LIGHT_THEME = {
     "bg": "#f4f6fa",
     "card": "#ffffff",
     "card2": "#e9eef7",
@@ -470,6 +470,44 @@ LIGHT_THEME = {
     "hover": "#c9922e",
     "flash_same": "#b8860b",
     "sold_bg": "#e6f6ec",
+}
+DEFAULT_THEME = {
+    "bg": "#0e1522",
+    "card": "#162031",
+    "card2": "#1c293c",
+    "accent": "#d8b775",
+    "accent_text": "#19202b",
+    "text": "#edf2fa",
+    "muted": "#a4b1c5",
+    "profit": "#40ce98",
+    "loss": "#f27d85",
+    "total": "#ffffff",
+    "total_bg": "#24354c",
+    "border": "#2c3b50",
+    "entry_bg": "#121d2d",
+    "row_alt": "#19263a",
+    "hover": "#e7ca95",
+    "flash_same": "#d8b775",
+    "sold_bg": "#16312f",
+}
+LIGHT_THEME = {
+    "bg": "#f2f5fa",
+    "card": "#ffffff",
+    "card2": "#edf2f8",
+    "accent": "#987022",
+    "accent_text": "#ffffff",
+    "text": "#203047",
+    "muted": "#5e6d82",
+    "profit": "#137c58",
+    "loss": "#bc3e4b",
+    "total": "#203047",
+    "total_bg": "#e8eff8",
+    "border": "#d8e1ed",
+    "entry_bg": "#ffffff",
+    "row_alt": "#f4f7fb",
+    "hover": "#ad843c",
+    "flash_same": "#987022",
+    "sold_bg": "#e7f4ef",
 }
 DEFAULT_TITLES = {
     "title": "✦ محفظة الذهب ✦",
@@ -2366,7 +2404,7 @@ class GoldApp:
             self.dark_mode = bool(d.get("dark_mode", True))
             self.theme = dict(self._base_theme())
             if d.get("theme_ver") == THEME_VER:
-                self.theme.update(d.get("theme", {}))
+                self.theme.update(self._modern_saved_theme(d.get("theme", {})))
             self.titles.update(d.get("titles", {}))
             self.sound_on = bool(d.get("sound_on", True))
             self.source_mode = "auto"  # migrate old saved choices to fresh primary feed
@@ -3159,18 +3197,18 @@ class GoldApp:
         t = self.theme
         palettes = {
             "primary": (t["accent"], t["accent_text"], t.get("hover", "#f3d8a5")),
-            "success": (t.get("profit", "#3ddc97"), "#07130d", "#6ae8b4"),
-            "danger": (t.get("loss", "#ff6b6b"), "#1a0a0a", "#ff9292"),
+            "success": (t["card2"], t["profit"], t["border"]),
+            "danger": (t["card2"], t["loss"], t["border"]),
             "neutral": (t["card2"], t["text"], t.get("border", "#252c39")),
             "ghost": (t["bg"], t["accent"], t.get("card2", "#1a2029")),
         }
         bg, fg, hv = palettes.get(kind, palettes["primary"])
         btn = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
                         activebackground=hv, activeforeground=fg, relief="flat",
-                        bd=0, padx=16, pady=7, cursor="hand2",
+                        bd=0, padx=12, pady=7, cursor="hand2",
                         highlightthickness=1,
                         highlightbackground=t.get("border", "#252c39"),
-                        highlightcolor=hv,
+                        highlightcolor=t["accent"],
                         font=("Segoe UI", font_size, "bold"), **kw)
 
         def _on_enter(_e=None):
@@ -3187,6 +3225,10 @@ class GoldApp:
 
         btn.bind("<Enter>", _on_enter)
         btn.bind("<Leave>", _on_leave)
+        tips = {"🙈": "إخفاء الأرقام لحماية الخصوصية", "👁": "إظهار الأرقام",
+                "🌓": "تبديل المظهر الداكن والفاتح", "☁": "مزامنة الحساب الآن"}
+        if text in tips:
+            self._attach_tooltip(btn, tips[text])
         return btn
 
     def _mkentry(self, parent, var, width=10):
@@ -3199,26 +3241,81 @@ class GoldApp:
                         highlightcolor=t.get("accent", "#e9c684"),
                         font=("Segoe UI", 10))
 
+    def _rounded_surface(self, parent, background):
+        surface = tk.Frame(parent, bg=parent.cget("bg"))
+        canvas = tk.Canvas(surface, bg=parent.cget("bg"), bd=0, highlightthickness=0)
+        canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        content = tk.Frame(surface, bg=background)
+        content.pack(fill="both", expand=True, padx=8, pady=6)
+        def draw(event):
+            w, h = event.width - 1, event.height - 1
+            r = min(self._px(12), w // 2, h // 2)
+            points = [r, 1, w-r, 1, w, 1, w, r, w, h-r, w, h,
+                      w-r, h, r, h, 1, h, 1, h-r, 1, r, 1, 1]
+            canvas.delete("surface")
+            canvas.create_polygon(points, smooth=True, splinesteps=24,
+                                  fill=background, outline=self.theme["border"],
+                                  width=1, tags="surface")
+        surface.bind("<Configure>", draw)
+        return surface, content
+
     def _price_card(self, parent, title, attr, color, col):
         t = self.theme
-        card = tk.Frame(parent, bg=t["card"], highlightthickness=1,
-                        highlightbackground=t.get("border", "#252c39"))
-        card.grid(row=0, column=col, padx=7, pady=(0, 4), sticky="nsew")
-        tk.Frame(card, bg=color, height=3).pack(fill="x")
+        surface, card = self._rounded_surface(parent, t["card"])
+        surface.grid(row=0, column=col, padx=7, pady=(0, 4), sticky="nsew")
+        tk.Frame(card, bg=t["accent"] if "rajhi" in attr else t["border"], height=2).pack(fill="x")
         title_lbl = tk.Label(card, text=title, bg=t["card"], fg=t["muted"],
                              font=("Segoe UI", 10))
-        title_lbl.pack(pady=(11, 2))
+        title_lbl.pack(pady=(5, 2))
         lbl = tk.Label(card, text="--", bg=t["card"], fg=color,
-                       font=("Segoe UI", 18, "bold"))
-        lbl.pack(pady=(0, 13))
+                       font=("Segoe UI", 20, "bold"))
+        lbl.pack(pady=(0, 7))
         setattr(self, attr, lbl)
         setattr(self, attr + "_title", title_lbl)
         self._card_base_titles = getattr(self, "_card_base_titles", {})
         self._card_base_titles[attr] = title
         parent.grid_columnconfigure(col, weight=1)
-        return card
+        return surface
 
     # ============================ بناء الواجهة ============================
+    def _modern_saved_theme(self, saved):
+        """Refresh stock colors only; retain all user-customized colors."""
+        legacy = LEGACY_DARK_THEME if getattr(self, "dark_mode", True) else LEGACY_LIGHT_THEME
+        modern = self._base_theme()
+        return {key: modern.get(key, value) if value == legacy.get(key) else value
+                for key, value in (saved or {}).items()}
+
+    def _attach_tooltip(self, widget, text):
+        state = {"timer": None, "window": None}
+        def hide(_event=None):
+            if state["timer"] is not None:
+                try: widget.after_cancel(state["timer"])
+                except tk.TclError: pass
+                state["timer"] = None
+            if state["window"] is not None:
+                try: state["window"].destroy()
+                except tk.TclError: pass
+                state["window"] = None
+        def show():
+            state["timer"] = None
+            if not widget.winfo_exists(): return
+            t = self.theme
+            tip = tk.Toplevel(widget)
+            state["window"] = tip
+            tip.overrideredirect(True)
+            tk.Label(tip, text=text, bg=t["card2"], fg=t["text"],
+                     font=("Segoe UI", 10), padx=10, pady=6, relief="solid", bd=1).pack()
+            tip.update_idletasks()
+            x = min(widget.winfo_rootx(), tip.winfo_screenwidth() - tip.winfo_reqwidth() - 12)
+            y = widget.winfo_rooty() + widget.winfo_height() + 6
+            tip.geometry("+{}+{}".format(max(0, x), max(0, y)))
+        def schedule(_event=None):
+            hide()
+            state["timer"] = widget.after(550, show)
+        widget.bind("<Enter>", schedule, add="+")
+        for event in ("<Leave>", "<ButtonPress>", "<Destroy>"):
+            widget.bind(event, hide, add="+")
+
     def _base_theme(self):
         """لوحة الألوان الأساسية حسب المظهر المختار."""
         return LIGHT_THEME if not getattr(self, "dark_mode", True) else DEFAULT_THEME
@@ -3331,15 +3428,13 @@ class GoldApp:
 
     def _dash_card(self, parent, title, attr, color, col):
         t = self.theme
-        card = tk.Frame(parent, bg=t.get("card2", t["card"]),
-                        highlightthickness=1,
-                        highlightbackground=t.get("border", "#252c39"))
-        card.grid(row=0, column=col, padx=6, sticky="nsew")
+        surface, card = self._rounded_surface(parent, t["card2"])
+        surface.grid(row=0, column=col, padx=6, sticky="nsew")
         tk.Label(card, text=title, bg=t.get("card2", t["card"]), fg=t["muted"],
-                 font=("Segoe UI", 10)).pack(pady=(5, 0))
+                 font=("Segoe UI", 10)).pack(pady=(2, 0))
         lbl = tk.Label(card, text="--", bg=t.get("card2", t["card"]), fg=color,
-                       font=("Segoe UI", 13, "bold"))
-        lbl.pack(pady=(1, 6))
+                       font=("Segoe UI", 16, "bold"))
+        lbl.pack(pady=(2, 3))
         setattr(self, attr, lbl)
         parent.grid_columnconfigure(col, weight=1)
         return card
@@ -3578,10 +3673,10 @@ class GoldApp:
                         highlightthickness=0)
         style.configure("Treeview.Heading", background=CARD2, foreground=GOLD,
                         font=("Segoe UI", 11, "bold"), relief="flat",
-                        padding=(p(9), p(10)))
+                        padding=(p(9), p(8)))
         style.map("Treeview",
                   background=[("selected", t.get("border", "#2c3a52"))],
-                  foreground=[("selected", "#ffffff")])
+                  foreground=[("selected", t["text"])])
         style.map("Treeview.Heading",
                   background=[("active", t.get("border", "#252c39"))])
         try:
@@ -3789,28 +3884,38 @@ class GoldApp:
         except Exception:
             pass
 
+        self.empty_operations = tk.Label(self.main_page, text="لا توجد عمليات لعرضها", bg=BG,
+                                         fg=MUT, font=("Segoe UI", 10))
+
         # الأزرار: كل الخيارات في شطر واحد (بلا «أمر بيع» — البيع من
         # زر «إضافة عملية (شراء / بيع)» أو Ctrl+S)
         btns = tk.Frame(self.main_page, bg=BG)
         btns.pack(fill="x", padx=p(12), pady=(p(6), p(2)))
-        self._mkbtn(btns, "🗑 حذف", self.del_item, kind="danger",
+        destructive = tk.Frame(btns, bg=BG)
+        destructive.pack(side="right", padx=(p(8), 0))
+        records = tk.Frame(btns, bg=BG)
+        records.pack(side="right", padx=p(4))
+        tools = tk.Frame(btns, bg=BG)
+        tools.pack(side="left", padx=p(4))
+        self._mkbtn(destructive, "🗑 حذف", self.del_item, kind="danger",
                     font_size=10).pack(side="right", padx=2)
-        self._mkbtn(btns, "مسح الكل", self.clear_all, kind="neutral",
+        self._mkbtn(destructive, "مسح الكل", self.clear_all, kind="neutral",
                     font_size=10).pack(side="right", padx=2)
-        self._mkbtn(btns, "📜 السجل", self.open_history, kind="neutral",
+        self._mkbtn(records, "📜 السجل", self.open_history, kind="neutral",
                     font_size=10).pack(side="right", padx=2)
-        self._mkbtn(btns, "⬇ Excel", self.export_excel, kind="success",
+        self._mkbtn(records, "⬇ Excel", self.export_excel, kind="success",
                     font_size=10).pack(side="right", padx=2)
-        self._mkbtn(btns, "🔔 تنبيه", self.open_alerts, kind="primary",
+        self._mkbtn(tools, "🔔 تنبيه", self.open_alerts, kind="neutral",
                     font_size=10).pack(side="left", padx=2)
-        self._mkbtn(btns, "📈 المخطط", self.show_chart, kind="primary",
+        self._mkbtn(tools, "📈 المخطط", self.show_chart, kind="neutral",
                     font_size=10).pack(side="left", padx=2)
-        self._mkbtn(btns, "📐 الزكاة", self.open_zakat, kind="neutral",
+        self._mkbtn(tools, "📐 الزكاة", self.open_zakat, kind="neutral",
                     font_size=10).pack(side="left", padx=2)
-        self.btn_widget = self._mkbtn(btns, "🪟 ويدجيت", self.toggle_widget,
+        self.btn_widget = self._mkbtn(tools, "🪟 ويدجيت", self.toggle_widget,
                                       kind="neutral", font_size=10)
         self.btn_widget.pack(side="left", padx=2)
         self._paint_widget_btn()
+        self.operations_toolbar = btns
 
         # الملخص
         self.lbl_sum = tk.Label(self.main_page, text="", bg=BG, fg=t["total"],
@@ -4952,7 +5057,7 @@ class GoldApp:
         header = tk.Frame(container, bg=BG)
         header.pack(fill="x", padx=px(24), pady=(px(16), px(8)))
         title_lbl = tk.Label(header, text=title, bg=BG, fg=t["accent"],
-                             font=("Segoe UI", 18, "bold"))
+                             font=("Segoe UI", 20, "bold"))
         title_lbl.pack(side="right")
         # محتوى الصفحة داخل منطقة تمرير حتى لا يُقصّ أي جزء على الشاشات الصغيرة
         scroll = ScrollArea(container, BG)
@@ -6202,9 +6307,22 @@ class GoldApp:
 
     def _fit_operations_table(self):
         """Keep only visible rows; the page handles scrolling for long lists."""
-        self.tree.configure(height=len(self.tree.get_children()))
+        count = len(self.tree.get_children())
+        self.tree.configure(height=count)
+        empty = getattr(self, "empty_operations", None)
+        toolbar = getattr(self, "operations_toolbar", None)
+        if empty is not None and toolbar is not None:
+            if count:
+                empty.pack_forget()
+            else:
+                empty.pack(fill="x", padx=self._px(18), pady=(0, 2), before=toolbar)
 
     def render(self):
+        viewport = None
+        canvas = getattr(getattr(self, "main_wrap", None), "canvas", None)
+        if canvas is not None:
+            try: viewport = canvas.yview()[0]
+            except (tk.TclError, AttributeError, TypeError): pass
         for i in self.tree.get_children():
             self.tree.delete(i)
         self.row_map = {}
@@ -6295,6 +6413,9 @@ class GoldApp:
                     sg_t="+" if total_pl > 0 else "")),
             fg=self.theme["total"])
         self._update_dashboard(t_qty_g, t_cost, t_val, t_pl)
+        if viewport is not None:
+            try: canvas.yview_moveto(viewport)
+            except tk.TclError: pass
 
     def update_price_labels(self):
         if self.spot_oz_usd:
