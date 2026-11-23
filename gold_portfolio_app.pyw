@@ -35,6 +35,9 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
+LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
+FLASH_MS = 7000                           # وميض تغيّر السعر: إيقاع ثابت كل 7 ثوانٍ
+FLASH_HOLD = 320                          # مدة بقاء الوميض (مللي ثانية)
 HOME_DIR = os.path.expanduser("~")
 # ملف واحد للبيانات القديمة (قبل نظام الحسابات) — يُتبنّى عند إنشاء أول حساب
 DATA_FILE = os.path.join(HOME_DIR, "gold_portfolio_data.json")
@@ -473,37 +476,69 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # ============================ أدوات مساعدة ============================
 def http_json(url, timeout=10):
     req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA,
-                                              "Accept": "application/json"})
+                                              "Accept": "application/json",
+                                              "Cache-Control": "no-cache",
+                                              "Pragma": "no-cache"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "ignore"))
 
 
 def _http_text(url, timeout=10):
-    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA,
+                                              "Cache-Control": "no-cache",
+                                              "Pragma": "no-cache"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "ignore")
 
 
-def fetch_spot_usd(mode="auto"):
-    """جلب سعر أونصة الذهب بالدولار من عدة مصادر مجانية."""
+def _yahoo_last(symbol):
+    data = http_json("https://query1.finance.yahoo.com/v8/finance/chart/{}"
+                     "?interval=1m&range=1d".format(symbol), timeout=5)
+    res = (data.get("chart") or {}).get("result") or []
+    meta = (res[0] or {}).get("meta") or {}
+    price = meta.get("regularMarketPrice")
+    if not price:
+        q = ((res[0].get("indicators") or {}).get("quote") or [{}])[0]
+        closes = [c for c in (q.get("close") or []) if c]
+        price = closes[-1] if closes else None
+    return price
+
+
+def fetch_spot_usd(mode="auto", timeout=4, only=False):
+    """جلب سعر أونصة الذهب بالدولار من عدة مصادر مجانية (بمهلة قصيرة لكل مصدر)."""
     sources = [
-        ("gold-api", lambda: http_json("https://api.gold-api.com/price/XAU").get("price")),
+        ("gold-api", lambda: http_json("https://api.gold-api.com/price/XAU",
+                                       timeout=timeout).get("price")),
         ("goldprice.org", lambda: http_json(
-            "https://data-asg.goldprice.org/dbXRates/USD")["items"][0]["xauPrice"]),
+            "https://data-asg.goldprice.org/dbXRates/USD",
+            timeout=timeout)["items"][0]["xauPrice"]),
+        ("yahoo", lambda: _yahoo_last("GC=F")),
+        ("paxg", lambda: http_json(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=pax-gold&vs_currencies=usd", timeout=timeout)["pax-gold"]["usd"]),
         ("stooq", lambda: float(
-            _http_text("https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv"
-                       ).strip().splitlines()[-1].split(",")[6])),
+            _http_text("https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv",
+                       timeout=timeout).strip().splitlines()[-1].split(",")[6])),
     ]
     if mode and mode != "auto":
-        sources = [s for s in sources if s[0] == mode] or sources
+        if only:
+            sources = [s for s in sources if s[0] == mode]
+        else:
+            # المصدر المختار أولاً، ثم البقية تلقائياً إن تعذّر (لا يتوقف التحديث أبداً)
+            first = [s for s in sources if s[0] == mode]
+            rest = [s for s in sources if s[0] != mode]
+            sources = first + rest
     last_err = None
+    started = time.time()
     for name, fn in sources:
+        if time.time() - started > 12:
+            break
         try:
             val = fn()
             if val and float(val) > 0:
                 return float(val), name
         except Exception as e:  # noqa
-            last_err = e
+            last_err = "{}: {}".format(name, e)
             continue
     raise RuntimeError("تعذّر جلب السعر: {}".format(last_err))
 
@@ -1466,6 +1501,7 @@ class GoldApp:
         self.buy_margin = 0.0       # فرق الراجحي للشراء (يُضاف لسعر الغرام)
         self.holdings = []          # عمليات الشراء المفتوحة (بالدولار داخلياً)
         self.sells = []             # عمليات البيع المحققة (سعر بيع مثبّت)
+        self.show_sells = True      # إظهار/إخفاء صفوف البيع في جدول العمليات
         self.history = []           # سجل كل العمليات
         self.price_hist = []        # عينات السعر [epoch, oz_usd]
         self.alerts = []
@@ -1482,6 +1518,10 @@ class GoldApp:
         self._ticks = 0
         self._fails = 0
         self._fx_last = 0.0
+        self._fetch_lock = threading.Lock()
+        self._fetch_busy = False
+        self._flash_job = None      # مؤقّت الوميض الثابت (7 ثوانٍ)
+        self._flash_price = 0.0     # السعر عند آخر وميض
         self.al_win = None
         self.row_map = {}
         self.price_widget = None   # الويدجيت العائم لسعر الغرام
@@ -2153,10 +2193,11 @@ class GoldApp:
             win.configure(bg=BG)
             win.transient(self.root)
             win.resizable(False, False)
-            w, h = 560, 470
             sw, sh = self._screen_size()
+            w = min(560, max(420, int(sw) - 40))
+            h = min(545, max(430, int(sh) - 80))   # لا تخرج عن الشاشة الصغيرة
             win.geometry("{}x{}+{}+{}".format(w, h, max(0, (sw - w) // 2),
-                                              max(0, (sh - h) // 3)))
+                                              max(6, (sh - h) // 4)))
             win.grab_set()
         except Exception:
             pass
@@ -2167,6 +2208,11 @@ class GoldApp:
                             if from_login else
                             "نسخة مشفّرة داخل بريدك — بلا قاعدة بيانات ولا رابط"),
                  bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(pady=(0, 8))
+
+        # شريط الأزرار أولاً ومثبّت في الأسفل: يبقى ظاهراً مهما طال المحتوى
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(side="bottom", fill="x", padx=14, pady=(6, 12))
+        btns = []
 
         body = tk.Frame(win, bg=CARD, highlightthickness=1,
                         highlightbackground=t.get("border", "#252c39"))
@@ -2188,8 +2234,12 @@ class GoldApp:
         v_mail = tk.StringVar(value=acct.get("email", "") or
                               (self.cloud_conf().get("last_email") or ""))
         v_pw = tk.StringVar(value="")
-        fld("البريد الإلكتروني (Gmail)", v_mail)
+        e_mail = fld("البريد الإلكتروني (Gmail)", v_mail)
         fld("كلمة مرور التطبيق (16 حرفاً)", v_pw, secret=True)
+        try:
+            e_mail.focus_set()
+        except Exception:
+            pass
 
         lbl = tk.Label(body, text="", bg=CARD, fg=MUT, wraplength=500,
                        justify="right", font=("Segoe UI", 10))
@@ -2204,10 +2254,6 @@ class GoldApp:
         self._mkbtn(body, "طريقة الحصول عليها", lambda: webbrowser.open(
             "https://myaccount.google.com/apppasswords"), kind="ghost",
             font_size=10).pack(anchor="e", padx=14, pady=(0, 8))
-
-        bar = tk.Frame(win, bg=BG)
-        bar.pack(fill="x", padx=14, pady=(4, 12))
-        btns = []
 
         def run(mode):
             for b in btns:
@@ -2275,7 +2321,8 @@ class GoldApp:
                     except Exception:
                         pass
 
-        btns.append(self._mkbtn(bar, "دخول واسترجاع", lambda: run("pull"),
+        main_txt = "✔ موافق ودخول" if from_login else "✔ دخول واسترجاع"
+        btns.append(self._mkbtn(bar, main_txt, lambda: run("pull"),
                                 kind="primary", font_size=11))
         btns[-1].pack(side="right", padx=4)
         btns.append(self._mkbtn(bar, "إرسال بيانات هذا الجهاز", lambda: run("push"),
@@ -2283,6 +2330,12 @@ class GoldApp:
         btns[-1].pack(side="right", padx=4)
         btns.append(self._mkbtn(bar, "إلغاء", win.destroy, kind="ghost", font_size=10))
         btns[-1].pack(side="left", padx=4)
+        try:
+            win.bind("<Return>", lambda e: run("pull"))
+            win.bind("<Escape>", lambda e: win.destroy())
+        except Exception:
+            pass
+
         def _pocket_here():
             try:
                 win.grab_release()
@@ -2293,8 +2346,9 @@ class GoldApp:
                 win.grab_set()
             except Exception:
                 pass
-        self._mkbtn(win, "أو 📦 نسخة بملف واحد (بلا بريد ولا كلمة مرور)",
-                    _pocket_here, kind="ghost", font_size=10).pack(pady=(0, 4))
+        self._mkbtn(body, "أو 📦 نسخة بملف واحد (بلا بريد ولا كلمة مرور)",
+                    _pocket_here, kind="ghost", font_size=10).pack(
+                        anchor="center", pady=(0, 10))
 
     def open_cloud_dialog(self, from_login=False):
         """نافذة ربط الحساب: بالبريد (Gmail) افتراضياً، أو Firebase إن كان مضمّناً."""
@@ -2512,6 +2566,7 @@ class GoldApp:
             self.titles.update(d.get("titles", {}))
             self.sound_on = bool(d.get("sound_on", True))
             self.source_mode = d.get("source_mode", "auto")
+            self.show_sells = bool(d.get("show_sells", True))
             self.spot_oz_usd = float(d.get("spot_oz_usd", 0.0) or 0.0)
             self.rates.update(d.get("rates", {}))
             self.last_update = d.get("last_update", "")
@@ -2550,6 +2605,7 @@ class GoldApp:
                     "titles": self.titles,
                     "sound_on": self.sound_on,
                     "source_mode": self.source_mode,
+                    "show_sells": bool(getattr(self, "show_sells", True)),
                     "spot_oz_usd": self.spot_oz_usd,
                     "rates": self.rates,
                     "last_update": self.last_update,
@@ -2636,6 +2692,7 @@ class GoldApp:
         """يعيد كل الحقول إلى الافتراضي قبل تحميل بيانات مستخدم آخر."""
         self.holdings = []
         self.sells = []
+        self.show_sells = True
         self.history = []
         self.price_hist = []
         self.alerts = []
@@ -2931,6 +2988,7 @@ class GoldApp:
             self.root.bind_all("<Control-s>", lambda e: self.open_sell(), add="+")
             self.root.bind_all("<Escape>", lambda e: self._shortcut_home(), add="+")
             self.root.bind_all("<F9>", lambda e: self.toggle_widget(), add="+")
+            self.root.bind_all("<F5>", lambda e: self.refresh_all(), add="+")
         except Exception:
             pass
 
@@ -3812,11 +3870,18 @@ class GoldApp:
         self.dot = tk.Label(updfr, text="●", bg=BG, fg=MUT, font=("Segoe UI", 10))
         self.dot.pack(side="right", padx=(6, 0))
         self.lbl_upd = tk.Label(updfr, text="جارٍ التحميل...", bg=BG, fg=MUT,
-                                font=("Segoe UI", 10))
+                                font=("Segoe UI", 10), cursor="hand2")
         self.lbl_upd.pack(side="right")
+        try:
+            # نقرة على سطر الحالة = تحديث فوري للسعر
+            self.lbl_upd.bind("<Button-1>", lambda e: self.refresh_all())
+        except Exception:
+            pass
         self.lbl_delta = tk.Label(updfr, text="", bg=BG, fg=MUT,
                                   font=("Segoe UI", 11, "bold"))
         self.lbl_delta.pack(side="left", padx=(0, 0))
+        self._mkbtn(updfr, "🔍 تشخيص", self.price_diag, kind="ghost",
+                    font_size=10).pack(side="left", padx=(8, 0))
 
         # شريط الإضافة: زر واحد فقط — تفاصيل العملية تُدخَل في صفحة مستقلة
         addbar = tk.Frame(self.main_page, bg=BG)
@@ -3829,6 +3894,11 @@ class GoldApp:
                  text="اختر «شراء» أو «بيع» ثم أدخل الوزن والعيار والسعر في صفحة مستقلة",
                  bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(side="right",
                                                             padx=p(10))
+        # إظهار/إخفاء صفوف البيع في قائمة العمليات
+        self.btn_sells = self._mkbtn(addbar, "👁 إخفاء البيع", self.toggle_sells,
+                                     kind="ghost", font_size=10)
+        self.btn_sells.pack(side="left", pady=2)
+        self._paint_sells_btn()
 
         # الجدول
         cols = ("name", "status", "qty", "buy", "cost", "cur", "val",
@@ -4788,10 +4858,20 @@ class GoldApp:
 
     # ============================ مخطط سعر الغرام ============================
     def _record_price_sample(self, oz_usd):
-        """يحفظ عينة سعر: كل العينات لآخر 24 ساعة، وعينة كل 5 دقائق لما قبلها حتى أسبوع."""
+        """يحفظ عينة سعر: كل ١٥ ثانية كحدّ أقصى لآخر 24 ساعة، وعينة/5 دقائق حتى أسبوع."""
         try:
             now = time.time()
-            self.price_hist.append([now, float(oz_usd)])
+            val = float(oz_usd)
+            if self.price_hist:
+                try:
+                    last_ts = float(self.price_hist[-1][0])
+                except Exception:
+                    last_ts = 0.0
+                if now - last_ts < 15:
+                    # نحدّث آخر نقطة بدل إضافة نقطة كل ٥ ثوانٍ (يمنع امتلاء السجل)
+                    self.price_hist[-1] = [now, val]
+                    return
+            self.price_hist.append([now, val])
             keep_from = now - 7 * 86400
             day_ago = now - 86400
             recent, older = [], []
@@ -4811,7 +4891,7 @@ class GoldApp:
                     bucket = b
                 else:
                     thinned[-1] = [ts, oz]
-            self.price_hist = (thinned + recent)[-6000:]
+            self.price_hist = (thinned + recent)[-9000:]
         except Exception:
             pass
 
@@ -5698,30 +5778,47 @@ class GoldApp:
             return
         self._live_on = True
         self.refresh_all()
-        self.root.after(30000, self._loop_refresh)
+        self.root.after(LIVE_MS, self._loop_refresh)
+        self._start_flash_loop()
 
     def _loop_refresh(self):
         if not getattr(self, "_live_on", False) or not getattr(self, "user", None):
             return
         self.refresh_all()
-        self.root.after(30000, self._loop_refresh)
+        self.root.after(self.refresh_interval(), self._loop_refresh)
+
+    def refresh_interval(self):
+        """٥ ثوانٍ في الوضع الطبيعي، وتباطؤ تلقائي عند تكرار فشل الاتصال."""
+        f = int(getattr(self, "_fails", 0) or 0)
+        if f >= 6:
+            return 60000
+        if f >= 4:
+            return 30000
+        if f >= 2:
+            return 15000
+        return LIVE_MS
 
     def refresh_all(self):
+        # لا نبدأ طلباً جديداً قبل انتهاء السابق (يمنع تراكم الطلبات وبطء الواجهة)
+        lock = getattr(self, "_fetch_lock", None) or threading.Lock()
+        self._fetch_lock = lock
+        with lock:
+            if getattr(self, "_fetch_busy", False):
+                return
+            self._fetch_busy = True
         threading.Thread(target=self._fetch_once, daemon=True).start()
 
     def _fetch_once(self):
         msg = ""
         direction = None
+        changed = False
         try:
             new_price, source = fetch_spot_usd(self.source_mode)
             old_price = self.spot_oz_usd
+            changed = (not old_price) or (abs(float(new_price) - float(old_price)) > 1e-9)
             self._delta_oz = (new_price - old_price) if old_price else 0.0
-            if old_price and new_price > old_price:
-                direction = "up"
-            elif old_price and new_price < old_price:
-                direction = "down"
-            else:
-                direction = "same"
+            direction = ("up" if new_price > old_price else
+                         ("down" if new_price < old_price else "same")) if old_price else None
             self.spot_oz_usd = new_price
             self._record_price_sample(new_price)
             self._ticks += 1
@@ -5733,29 +5830,93 @@ class GoldApp:
             closed = "  •  🔒 السوق مغلق — السعر ثابت حتى الفتح" if market_closed() else ""
             msg = "● مباشر ({src}) • الأونصة ${p:.3f} • {t} • تحديثات {n}{c}".format(
                 src=source, p=new_price, t=now, n=self._ticks, c=closed)
-        except Exception:
+        except Exception as e:
             direction = None
             self._fails += 1
+            reason = ""
+            try:
+                reason = str(e).split(":", 1)[-1].strip()[:45]
+            except Exception:
+                reason = ""
+            tag = " ({})".format(reason) if reason and self._fails <= 3 else ""
             if self.spot_oz_usd:
-                msg = "تعذّر التحديث (محاولة {})… عرض آخر سعر معروف".format(self._fails)
+                when = " — آخر سعر {}".format(self.last_update) if self.last_update else ""
+                msg = "تعذّر التحديث (محاولة {}){}… عرض آخر سعر معروف{}".format(
+                    self._fails, tag, when)
             else:
-                msg = "تعذّر جلب سعر الذهب — تحقق من الإنترنت"
+                msg = ("تعذّر جلب سعر الذهب{} — اضغط «🔍 تشخيص» أو «F5»"
+                       .format(tag))
 
         nowt = time.monotonic()
+        fx_changed = False
         if nowt - self._fx_last > 300:
             try:
-                fx = http_json("https://open.er-api.com/v6/latest/USD", timeout=8)
+                fx = http_json("https://open.er-api.com/v6/latest/USD", timeout=6)
                 if fx.get("rates"):
                     for k in ("SAR", "JOD", "KWD", "QAR", "EGP"):
-                        if k in fx["rates"]:
+                        if k in fx["rates"] and abs(
+                                float(fx["rates"][k]) - float(self.rates.get(k, 0) or 0)) > 1e-9:
                             self.rates[k] = fx["rates"][k]
+                            fx_changed = True
                 self._fx_last = nowt
             except Exception:
                 pass
 
-        self.root.after(0, lambda: (self.lbl_upd.config(text=msg),
-                                    self.render(),
-                                    self.flash_update(direction)))
+        def paint():
+            try:
+                self.lbl_upd.config(text=msg)
+            except Exception:
+                pass
+            # إعادة الرسم فقط عند تغيّر السعر/سعر الصرف فعلاً (تمنع رجفة الجدول)
+            if changed or fx_changed:
+                try:
+                    self.render()
+                except Exception:
+                    pass
+            # الوميض له إيقاعه الثابت (كل 7 ثوانٍ) وليس مع كل جلب
+
+        try:
+            self.root.after(0, paint)
+        except Exception:
+            pass
+        finally:
+            lock = getattr(self, "_fetch_lock", None)
+            if lock is not None:
+                with lock:
+                    self._fetch_busy = False
+
+
+    # ---------- وميض تغيّر السعر: إيقاع ثابت كل 7 ثوانٍ ----------
+    def _start_flash_loop(self):
+        """يضبط مرجع الوميض وينطلق بمؤقّت ثابت (7 ثوانٍ)."""
+        job = getattr(self, "_flash_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._flash_job = None
+        self._flash_price = float(getattr(self, "spot_oz_usd", 0) or 0)
+        try:
+            self._flash_job = self.root.after(FLASH_MS, self._flash_tick)
+        except Exception:
+            self._flash_job = None
+
+    def _flash_tick(self):
+        """كل 7 ثوانٍ: يومض فقط إذا تغيّر السعر فعلاً منذ الوميض السابق."""
+        self._flash_job = None
+        if not getattr(self, "_live_on", False) or not getattr(self, "user", None):
+            return
+        cur = float(getattr(self, "spot_oz_usd", 0) or 0)
+        prev = float(getattr(self, "_flash_price", 0) or 0)
+        if cur:
+            self._flash_price = cur
+        if cur and prev and abs(cur - prev) > 1e-9 and not getattr(self, "locked", False):
+            self.flash_update("up" if cur > prev else "down")
+        try:
+            self._flash_job = self.root.after(FLASH_MS, self._flash_tick)
+        except Exception:
+            self._flash_job = None
 
     def flash_update(self, direction=None):
         t = self.theme
@@ -5788,9 +5949,96 @@ class GoldApp:
                 self.dot.config(fg=rest)
             except Exception:
                 pass
-        self.root.after(260, revert)
+        self.root.after(FLASH_HOLD, revert)
 
     # ============================ العرض ============================
+    def price_diag(self):
+        """يفحص كل مصدر سعر على حدة ويعرض النتيجة بالثواني (لتشخيص أي مشكلة)."""
+        t = self.theme
+        BG, CARD = t.get("bg", "#0a0c11"), t.get("card", "#151a23")
+        TXT, MUT, GOLD = t.get("text", "#fff"), t.get("muted", "#888"), t.get("accent", "#e9c684")
+        win = tk.Toplevel(self.root)
+        try:
+            win.title("تشخيص تحديث السعر")
+            win.configure(bg=BG)
+            win.transient(self.root)
+            w, h = 600, 430
+            sw, sh = self._screen_size()
+            win.geometry("{}x{}+{}+{}".format(w, h, max(0, (sw - w) // 2),
+                                              max(0, (sh - h) // 3)))
+        except Exception:
+            pass
+        tk.Label(win, text="🔍  تشخيص تحديث السعر", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 14, "bold")).pack(pady=(12, 2))
+        tk.Label(win, text=("السعر الحالي: {}  •  آخر تحديث: {}  •  المصدر المختار: {}"
+                            "\nالسوق: {}  •  محاولات فاشلة متتالية: {}").format(
+            ("${:,.2f}".format(self.spot_oz_usd) if self.spot_oz_usd else "—"),
+            self.last_update or "—", self.source_mode or "auto",
+            ("مغلق" if market_closed() else "مفتوح"), self._fails),
+                 bg=BG, fg=MUT, justify="right", font=("Segoe UI", 10)).pack(pady=(0, 6))
+        box = tk.Frame(win, bg=CARD, highlightthickness=1,
+                       highlightbackground=t.get("border", "#252c39"))
+        box.pack(fill="both", expand=True, padx=14, pady=6)
+        txt = tk.Text(box, height=9, bg=CARD, fg=TXT, relief="flat", bd=0,
+                      font=("Segoe UI", 10), wrap="word")
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("end", "جارٍ فحص المصادر…\n")
+
+        def add(line):
+            def do():
+                try:
+                    txt.insert("end", line + "\n")
+                    txt.see("end")
+                except Exception:
+                    pass
+            try:
+                win.after(0, do)
+            except Exception:
+                pass
+
+        def run():
+            names = ("gold-api", "goldprice.org", "yahoo", "paxg", "stooq")
+            for name in names:
+                t0 = time.time()
+                try:
+                    price, _src = fetch_spot_usd(name, timeout=6, only=True)
+                    add("✔ {}   ${:,.2f}   ({:.2f} ثانية)".format(
+                        name, price, time.time() - t0))
+                except Exception as e:
+                    reason = str(e).split(":", 1)[-1].strip()[:70] or type(e).__name__
+                    add("✘ {}   {}   ({:.2f} ثانية)".format(
+                        name, reason, time.time() - t0))
+            add("")
+            add("النتيجة: البرنامج يستخدم أول مصدر ينجح، ويعود للبقية تلقائياً."
+                if self.spot_oz_usd else
+                "النتيجة: لا يوجد سعر بعد — إن فشلت كل المصادر فالمشكلة في الاتصال/الجدار الناري.")
+
+        threading.Thread(target=run, daemon=True).start()
+        self._mkbtn(win, "إغلاق", win.destroy, kind="neutral",
+                    font_size=10).pack(pady=(0, 10))
+
+    def toggle_sells(self):
+        """زر واحد: إخفاء/إظهار عمليات البيع التي تمّت من جدول العمليات."""
+        self.show_sells = not bool(getattr(self, "show_sells", True))
+        self._paint_sells_btn()
+        try:
+            self.save()
+        except Exception:
+            pass
+        self.render()
+
+    def _paint_sells_btn(self):
+        btn = getattr(self, "btn_sells", None)
+        if btn is None:
+            return
+        n = len(getattr(self, "sells", []) or [])
+        try:
+            btn.config(text=("👁 إخفاء البيع ({})".format(n) if
+                             bool(getattr(self, "show_sells", True))
+                             else "👁 إظهار البيع ({})".format(n)))
+        except Exception:
+            pass
+
     def render(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
@@ -5829,7 +6077,8 @@ class GoldApp:
                 "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
                 "{}{:.2f}%".format("+" if pl > 0 else "", pct))))
             rowi += 1
-        # عمليات البيع (خضراء — سعر بيع مثبّت)
+        # عمليات البيع (خضراء — سعر بيع مثبّت). الربح المحقق يُحسب دائماً
+        show_sells = bool(getattr(self, "show_sells", True))
         for sidx, s in enumerate(self.sells):
             unit_txt = "أونصة" if s["unit"] == "oz" else "غرام"
             cost_disp = s["qty"] * s["buy"] * self.rate()
@@ -5839,6 +6088,8 @@ class GoldApp:
             pl = value_disp - cost_disp
             pct = (pl / cost_disp * 100) if cost_disp else 0
             realized += pl
+            if not show_sells:
+                continue
             iid = "s{}".format(sidx)
             self.row_map[iid] = ("sell", sidx)
             self.tree.insert("", "end", iid=iid, tags=("soldgreen",),
@@ -5853,6 +6104,7 @@ class GoldApp:
                 "{}{:,.2f}".format(sym, sell_disp),
                 "{}{}{:,.2f}".format("+" if pl > 0 else "", sym, pl),
                 "{}{:.2f}%".format("+" if pl > 0 else "", pct))))
+        self._paint_sells_btn()
         self.update_price_labels()
         self.check_alerts()
         t_pl = t_val - t_cost
