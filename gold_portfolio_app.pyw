@@ -43,7 +43,7 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
-APP_VERSION = "PriceFix-17-ModernUI"
+APP_VERSION = "PriceFix-18-Sidebar"
 HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
 FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
@@ -3195,6 +3195,8 @@ class GoldApp:
     # ============================ مساعدات واجهة ============================
     def _mkbtn(self, parent, text, cmd, kind="primary", font_size=11, **kw):
         t = self.theme
+        if text not in ("🙈", "👁", "🌓", "☁"):
+            text = re.sub(r"[\U0001F300-\U0001FAFF\u2700-\u27FF\u2190-\u21FF\u2B00-\u2BFF]", "", text).strip()
         palettes = {
             "primary": (t["accent"], t["accent_text"], t.get("hover", "#f3d8a5")),
             "success": (t["card2"], t["profit"], t["border"]),
@@ -3437,6 +3439,7 @@ class GoldApp:
         lbl.pack(pady=(2, 3))
         setattr(self, attr, lbl)
         parent.grid_columnconfigure(col, weight=1)
+        return surface
         return card
 
     def _update_dashboard(self, qty_g, cost, val, pl):
@@ -3636,6 +3639,124 @@ class GoldApp:
         self.root.geometry("{}x{}".format(w, h))
         self.root.minsize(880, 560)
 
+    def _build_sidebar(self):
+        t = self.theme
+        self._nav_buttons = {}
+        self._nav_labels = {}
+        tk.Label(self.sidebar, text="التنقل", bg=t["card"], fg=t["muted"],
+                 font=("Segoe UI", 10)).pack(fill="x", pady=(18, 12))
+        items = [("main", "المحفظة", lambda: self._show_page("main")),
+                 ("chart", "المخطط", self.show_chart),
+                 ("history", "سجل العمليات", self.open_history),
+                 ("alerts", "التنبيهات", self.open_alerts),
+                 ("zakat", "الزكاة", self.open_zakat),
+                 ("settings", "الإعدادات", self.open_settings)]
+        self._nav_images = {}
+        for key, label, command in items + [("account", "الحساب", self.open_account)]:
+            button = self._mkbtn(self.sidebar, label, command, kind="neutral", font_size=11)
+            button.configure(anchor="e", padx=12, pady=11, bg=t["card"], relief="flat")
+            try:
+                folder = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+                mode = "dark" if getattr(self, "dark_mode", True) else "light"
+                image = tk.PhotoImage(file=os.path.join(folder, "nav_{}_{}.png".format(mode, key)))
+                self._nav_images[key] = image
+                button.configure(image=image, compound="right")
+            except (tk.TclError, OSError):
+                pass
+            if key == "account":
+                button.pack(side="bottom", fill="x", padx=8, pady=16)
+            else:
+                button.pack(fill="x", padx=8, pady=3)
+            self._nav_buttons[key] = button
+            self._nav_labels[key] = label
+            self._attach_tooltip(button, label)
+            button.bind("<Leave>", lambda event: self._paint_navigation(getattr(self, "_page", "main")), add="+")
+        self.btn_settings = self._nav_buttons["settings"]
+        self._sidebar_compact = None
+
+    def _paint_navigation(self, page):
+        t = self.theme
+        active = "main" if page in ("addbuy", "sell", "editholding") else page
+        for key, button in getattr(self, "_nav_buttons", {}).items():
+            button.configure(bg=t["total_bg"] if key == active else t["card"],
+                             fg=t["accent"] if key == active else t["text"])
+        title = getattr(self, "page_title", None)
+        if title is not None:
+            title.configure(text={"main":"المحفظة", "chart":"المخطط", "history":"سجل العمليات",
+                                  "alerts":"التنبيهات", "zakat":"الزكاة", "settings":"الإعدادات",
+                                  "account":"الحساب", "addbuy":"إضافة شراء", "sell":"أمر بيع",
+                                  "editholding":"تعديل المقتنى"}.get(page, "المحفظة"))
+
+    def _responsive_shell(self, event=None):
+        if event is not None and event.widget is not self.app_shell:
+            return
+        compact = self.app_shell.winfo_width() < self._px(1120)
+        if compact == getattr(self, "_sidebar_compact", None):
+            return
+        self._sidebar_compact = compact
+        self.sidebar.configure(width=self._px(64 if compact else 174))
+        for key, button in self._nav_buttons.items():
+            button.configure(text="" if compact and key in self._nav_images else self._nav_labels[key],
+                             anchor="center" if compact else "e", padx=6 if compact else 12)
+        self._paint_navigation(getattr(self, "_page", "main"))
+
+    def _responsive_cards(self, event=None):
+        summaries = getattr(self, "_summary_cards", [])
+        prices = getattr(self, "_price_cards", [])
+        if not summaries or not prices:
+            return
+        width = self.main_wrap.canvas.winfo_width()
+        cols = 2 if width < self._px(860) else 4
+        key = (cols, self.cur == "SAR")
+        if key == getattr(self, "_cards_layout_key", None):
+            return
+        self._cards_layout_key = key
+        for cards in (summaries, prices):
+            parent = cards[0].master
+            for column in range(4): parent.grid_columnconfigure(column, weight=0, uniform="", minsize=0)
+            visible = cards if cards is summaries or self.cur == "SAR" else cards[:2]
+            for card in cards: card.grid_remove()
+            for index, card in enumerate(visible):
+                # Main financial hierarchy begins on the right.
+                column = cols - 1 - index % cols
+                card.grid(row=index // cols, column=column, sticky="nsew", padx=6, pady=4)
+                parent.grid_columnconfigure(column, weight=1, uniform="cards")
+
+    def _sync_selection_actions(self, event=None):
+        tree = getattr(self, "tree", None)
+        selected = tree.selection() if tree is not None and hasattr(tree, "selection") else ()
+        mapped = getattr(self, "row_map", {}).get(selected[0]) if selected else None
+        delete = getattr(self, "btn_delete", None)
+        edit = getattr(self, "btn_edit", None)
+        if delete is not None: delete.configure(state="normal" if mapped else "disabled")
+        if edit is not None: edit.configure(state="normal" if mapped and mapped[0] == "hold" else "disabled")
+
+    def _operations_more(self):
+        t = self.theme
+        menu = tk.Menu(self.root, tearoff=False, bg=t["card"], fg=t["text"],
+                       activebackground=t["card2"], activeforeground=t["accent"],
+                       font=("Segoe UI", 11))
+        menu.add_command(label="مسح جميع العمليات…", command=self.clear_all)
+        try:
+            menu.tk_popup(self.btn_more.winfo_rootx(), self.btn_more.winfo_rooty() + self.btn_more.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _form_section(self, parent, title):
+        t = self.theme
+        frame = tk.LabelFrame(parent, text="  " + title + "  ", bg=t["card"], fg=t["accent"],
+                              font=("Segoe UI", 11, "bold"), bd=0,
+                              highlightthickness=1, highlightbackground=t["border"], padx=12, pady=10)
+        frame.pack(fill="x", padx=8, pady=8)
+        return frame
+
+    def _form_actions(self, key):
+        footer = self._pages[key]["footer"]
+        for child in footer.winfo_children(): child.destroy()
+        actions = tk.Frame(footer, bg=self.theme["bg"])
+        actions.pack(fill="x", pady=4)
+        return actions
+
     def build_ui(self):
         self._live_chart_views = []
         self._chart_widgets = []
@@ -3648,8 +3769,13 @@ class GoldApp:
         p = self._px
 
         # حاوية الصفحات: الرئيسية + المخطط (تنقّل داخل نفس النافذة)
-        self.page_holder = tk.Frame(self.root, bg=BG)
-        self.page_holder.pack(fill="both", expand=True)
+        self.app_shell = tk.Frame(self.root, bg=BG)
+        self.app_shell.pack(fill="both", expand=True)
+        self.sidebar = tk.Frame(self.app_shell, bg=CARD, width=p(174))
+        self.sidebar.pack(side="right", fill="y", padx=(p(8), 0))
+        self.sidebar.pack_propagate(False)
+        self.page_holder = tk.Frame(self.app_shell, bg=BG)
+        self.page_holder.pack(side="left", fill="both", expand=True)
         # الصفحة الرئيسية داخل منطقة تمرير: لا يُقصّ أي محتوى مهما صغُر الارتفاع
         self.main_wrap = ScrollArea(self.page_holder, BG)
         self.main_wrap.pack(fill="both", expand=True)
@@ -3688,46 +3814,40 @@ class GoldApp:
         except Exception:
             pass
 
-        # العنوان
+        # رأس مختصر مع هوية بصرية ثابتة
         hdr = tk.Frame(self.root, bg=BG)
-        hdr.pack(fill="x", padx=p(22), pady=(p(16), p(4)),
-                 before=self.page_holder)
-        hdr.grid_columnconfigure(0,weight=1,uniform="header_sides")
-        hdr.grid_columnconfigure(1,weight=0)
-        hdr.grid_columnconfigure(2,weight=1,uniform="header_sides")
-        brand=tk.Frame(hdr,bg=BG)
-        brand.grid(row=0,column=1)
+        hdr.pack(fill="x", padx=p(20), pady=(p(12), p(8)), before=self.app_shell)
+        hdr.grid_columnconfigure(0, weight=1)
+        hdr.grid_columnconfigure(1, weight=1)
+        hdr.grid_columnconfigure(2, weight=1)
+        brand = tk.Frame(hdr, bg=BG)
+        brand.grid(row=0, column=1)
         try:
-            asset_dir=getattr(sys,"_MEIPASS",None) or os.path.dirname(os.path.abspath(__file__))
-            self._brand_image=tk.PhotoImage(file=os.path.join(asset_dir,"brand_badge.png"))
-            tk.Label(brand,image=self._brand_image,bg=BG).pack()
-            self.root.iconphoto(True,self._brand_image)
-        except (tk.TclError,OSError):
-            self._brand_image=None
-        tk.Label(brand,text="محفظة الذهب",bg=BG,fg=GOLD,
-                 font=("Segoe UI",14,"bold")).pack(pady=(2,0))
+            asset_dir = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+            image = tk.PhotoImage(file=os.path.join(asset_dir, "brand_badge.png"))
+            self.root.iconphoto(True, image)
+            self._brand_image = image.subsample(2, 2)
+            tk.Label(brand, image=self._brand_image, bg=BG).pack(side="right", padx=6)
+        except (tk.TclError, OSError):
+            self._brand_image = None
+        tk.Label(brand, text="محفظة الذهب", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 14, "bold")).pack(side="right")
+        self.page_title = tk.Label(hdr, text="المحفظة", bg=BG, fg=TXT,
+                                   font=("Segoe UI", 14, "bold"))
+        self.page_title.grid(row=0, column=2, sticky="e")
         if getattr(self, "user", None):
             chip = tk.Frame(hdr, bg=BG)
-            chip.grid(row=0,column=0,sticky="w")
-            self.btn_privacy = self._mkbtn(
-                chip, "👁" if getattr(self, "privacy", False) else "🙈",
-                self.toggle_privacy, kind="ghost", font_size=10)
-            self.btn_privacy.pack(side="left", padx=(8, 0))
-            self._mkbtn(chip, "🌓", self.toggle_theme, kind="ghost",
-                        font_size=10).pack(side="left", padx=(4, 0))
-            self.btn_cloud = self._mkbtn(chip, "☁",
-                                         lambda: self.cloud_sync_now(True),
-                                         kind="ghost", font_size=10)
-            self.btn_cloud.pack(side="left", padx=(4, 0))
-            self._mkbtn(chip, "الحساب", self.open_account, kind="ghost",
-                        font_size=10).pack(side="left", padx=(4, 0))
-            self.btn_settings=self._mkbtn(chip,"⚙ الإعدادات",self.open_settings,kind="ghost",font_size=10)
-            self.btn_settings.pack(side="left",padx=(4,0))
-            tk.Label(chip, text="👤  " + self.user, bg=BG, fg=TXT,
-                     font=("Segoe UI", 11, "bold")).pack(side="left")
-        tk.Frame(self.root, bg=t.get("border", "#252c39"),
-                 height=1).pack(fill="x", padx=20, pady=(4, 0),
-                                before=self.page_holder)
+            chip.grid(row=0, column=0, sticky="w")
+            self.btn_privacy = self._mkbtn(chip, "👁" if getattr(self, "privacy", False) else "🙈",
+                                          self.toggle_privacy, kind="ghost", font_size=10)
+            self.btn_privacy.pack(side="left", padx=2)
+            self._mkbtn(chip, "🌓", self.toggle_theme, kind="ghost", font_size=10).pack(side="left", padx=2)
+            self.btn_cloud = self._mkbtn(chip, "☁", lambda: self.cloud_sync_now(True), kind="ghost", font_size=10)
+            self.btn_cloud.pack(side="left", padx=2)
+            tk.Label(chip, text=self.user, bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(side="left", padx=6)
+        self._build_sidebar()
+        self.app_shell.bind("<Configure>", self._responsive_shell, add="+")
+        tk.Frame(self.root, bg=t["border"], height=1).pack(fill="x", before=self.app_shell)
 
         # بطاقات الأسعار (تُحزَم لاحقاً أسفل سطر العملة والعيار)
         prices = tk.Frame(self.main_page, bg=BG)
@@ -3759,7 +3879,9 @@ class GoldApp:
         self.karat_var.trace_add("write", lambda *a: self.on_karat_change())
 
         # فروق الراجحي (تُخفى تلقائياً عند اختيار عملة غير الريال السعودي)
-        self.rajhi_frame = tk.Frame(ctrl, bg=BG)
+        market_options = tk.Frame(self.main_page, bg=BG)
+        market_options.pack(fill="x", padx=p(20), pady=(0, p(4)))
+        self.rajhi_frame = tk.Frame(market_options, bg=BG)
         self.rajhi_frame.pack(side="right")
 
         lbl_adj = tk.Label(self.rajhi_frame, text="فرق البيع/غرام:", bg=BG, fg=TXT,
@@ -3788,21 +3910,25 @@ class GoldApp:
         self._mkbtn(ctrl, "🧮 حاسبة التكلفة", self.open_calc, kind="neutral",
                     font_size=10).pack(side="left", padx=6)
 
-        # بطاقات الأسعار تحت سطر العملة والعيار مباشرة
+        self._price_cards = [self.lbl_oz.master.master, self.lbl_gr.master.master,
+                             self.card_rajhi_buy, self.card_rajhi_sell]
+        self._cards_layout_key = None
+        # بطاقات الأسعار تحت خيارات العملة والعيار
         prices.pack(fill="x", padx=p(16), pady=(p(8), p(8)))
 
         # ملاحظة تظهر عند اختيار عملة غير الريال السعودي
         self.rajhi_note = tk.Label(
-            ctrl, text="ℹ أسعار الراجحي متاحة بالريال السعودي فقط",
+            market_options, text="ℹ أسعار الراجحي متاحة بالريال السعودي فقط",
             bg=BG, fg=MUT, font=("Segoe UI", 10))
 
         # لوحة ملخص سريعة (تُقرأ بنظرة واحدة)
+        self._summary_cards = []
         dash = tk.Frame(self.main_page, bg=BG)
-        dash.pack(fill="x", padx=p(16), pady=(p(2), p(2)))
-        self._dash_card(dash, "إجمالي الغرامات", "dash_qty", TXT, 0)
-        self._dash_card(dash, "التكلفة", "dash_cost", TXT, 1)
-        self._dash_card(dash, "القيمة الحالية", "dash_val", GOLD, 2)
-        self._dash_card(dash, "الربح غير المحقق", "dash_pl", t["profit"], 3)
+        dash.pack(fill="x", padx=p(16), pady=(p(12), p(8)), before=ctrl)
+        self._summary_cards.append(self._dash_card(dash, "إجمالي الغرامات", "dash_qty", TXT, 0))
+        self._summary_cards.append(self._dash_card(dash, "التكلفة", "dash_cost", TXT, 1))
+        self._summary_cards.append(self._dash_card(dash, "القيمة الحالية", "dash_val", GOLD, 2))
+        self._summary_cards.append(self._dash_card(dash, "الربح غير المحقق", "dash_pl", t["profit"], 3))
 
         # Caption and price change occupy different rows: neither can cover the other.
         updfr = tk.Frame(self.main_page, bg=BG)
@@ -3822,17 +3948,16 @@ class GoldApp:
         self.lbl_delta.pack(side="right",padx=4)
         self._set_update_caption()
 
+        tk.Label(self.main_page, text="العمليات", bg=BG, fg=TXT,
+                 font=("Segoe UI", 13, "bold"), anchor="e").pack(fill="x", padx=p(20), pady=(p(10), p(4)))
         # شريط الإضافة: العمليات
         addbar = tk.Frame(self.main_page, bg=BG)
         addbar.pack(fill="x", padx=p(18), pady=(p(4), p(2)))
-        self.btn_add = self._mkbtn(addbar, "＋  إضافة عملية (شراء / بيع)",
+        self.btn_add = self._mkbtn(addbar, "+  إضافة عملية (شراء / بيع)",
                                    self.open_add_chooser, kind="primary",
                                    font_size=12)
         self.btn_add.pack(side="right", pady=2)
-        tk.Label(addbar,
-                 text="اختر «شراء» أو «بيع» ثم أدخل الوزن والعيار والسعر",
-                 bg=BG, fg=MUT, font=("Segoe UI", 10)).pack(side="right",
-                                                            padx=p(10))
+        self._attach_tooltip(self.btn_add, "اختر «شراء» أو «بيع» ثم أدخل الوزن والعيار والسعر")
         # إظهار/إخفاء صفوف البيع في قائمة العمليات
         self.btn_sells = self._mkbtn(addbar, "👁 إخفاء البيع", self.toggle_sells,
                                      kind="ghost", font_size=10)
@@ -3840,8 +3965,14 @@ class GoldApp:
         self._paint_sells_btn()
         edits=tk.Frame(self.main_page,bg=BG)
         edits.pack(fill="x",padx=p(18),pady=2)
-        self._mkbtn(edits,"تعديل المقتنى المحدد",self.open_edit_holding,kind="neutral",font_size=10).pack(side="right",padx=4)
+        self.btn_edit = self._mkbtn(edits, "تعديل المحدد", self.open_edit_holding, kind="neutral", font_size=10)
+        self.btn_edit.pack(side="right", padx=4)
         self._mkbtn(edits,"↶ التراجع",self.undo_last_change,kind="neutral",font_size=10).pack(side="right",padx=4)
+        self.btn_delete = self._mkbtn(edits, "حذف المحدد", self.del_item, kind="danger", font_size=10)
+        self.btn_delete.pack(side="right", padx=4)
+        self._mkbtn(edits, "Excel", self.export_excel, kind="neutral", font_size=10).pack(side="left", padx=4)
+        self.btn_more = self._mkbtn(edits, "المزيد ▾", self._operations_more, kind="ghost", font_size=10)
+        self.btn_more.pack(side="left", padx=4)
         self.root.bind("<Control-z>",self._undo_shortcut)
         self.root.bind("<Control-Z>",self._undo_shortcut)
 
@@ -3853,14 +3984,19 @@ class GoldApp:
         tree_wrap = tk.Frame(self.main_page, bg=BG)
         tree_wrap.pack(fill="x", padx=p(18), pady=p(6))
         self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
-                                 height=0)
+                                 height=0,
+                                 displaycolumns=("pct", "sellprice", "buy", "cur", "pl", "val", "cost", "qty", "status", "name"))
         for c, h in zip(cols, heads):
             self.tree.heading(c, text=h)
             self.tree.column(c, anchor="center", width=110)
-        self.tree.column("name", width=130)
+        self.tree.column("name", width=150, anchor="e")
         self.tree.column("status", width=110)
         self.tree.column("sellprice", width=125)
         self.tree.column("pct", width=80)
+        for column in ("qty", "buy", "cost", "cur", "val", "sellprice", "pl", "pct"):
+            self.tree.column(column, anchor="e")
+        self.tree.bind("<Configure>", lambda event: self.tree.xview_moveto(1.0), add="+")
+        self.tree.bind("<<TreeviewSelect>>", self._sync_selection_actions, add="+")
         self.tree_x = ttk.Scrollbar(tree_wrap, orient="horizontal",
                                     command=self.tree.xview)
         self.tree.configure(xscrollcommand=self.tree_x.set)
@@ -3887,41 +4023,22 @@ class GoldApp:
         self.empty_operations = tk.Label(self.main_page, text="لا توجد عمليات لعرضها", bg=BG,
                                          fg=MUT, font=("Segoe UI", 10))
 
-        # الأزرار: كل الخيارات في شطر واحد (بلا «أمر بيع» — البيع من
-        # زر «إضافة عملية (شراء / بيع)» أو Ctrl+S)
+        # أدوات ثانوية أسفل الجدول؛ بقية الصفحات في شريط التنقل.
         btns = tk.Frame(self.main_page, bg=BG)
-        btns.pack(fill="x", padx=p(12), pady=(p(6), p(2)))
-        destructive = tk.Frame(btns, bg=BG)
-        destructive.pack(side="right", padx=(p(8), 0))
-        records = tk.Frame(btns, bg=BG)
-        records.pack(side="right", padx=p(4))
-        tools = tk.Frame(btns, bg=BG)
-        tools.pack(side="left", padx=p(4))
-        self._mkbtn(destructive, "🗑 حذف", self.del_item, kind="danger",
-                    font_size=10).pack(side="right", padx=2)
-        self._mkbtn(destructive, "مسح الكل", self.clear_all, kind="neutral",
-                    font_size=10).pack(side="right", padx=2)
-        self._mkbtn(records, "📜 السجل", self.open_history, kind="neutral",
-                    font_size=10).pack(side="right", padx=2)
-        self._mkbtn(records, "⬇ Excel", self.export_excel, kind="success",
-                    font_size=10).pack(side="right", padx=2)
-        self._mkbtn(tools, "🔔 تنبيه", self.open_alerts, kind="neutral",
-                    font_size=10).pack(side="left", padx=2)
-        self._mkbtn(tools, "📈 المخطط", self.show_chart, kind="neutral",
-                    font_size=10).pack(side="left", padx=2)
-        self._mkbtn(tools, "📐 الزكاة", self.open_zakat, kind="neutral",
-                    font_size=10).pack(side="left", padx=2)
-        self.btn_widget = self._mkbtn(tools, "🪟 ويدجيت", self.toggle_widget,
-                                      kind="neutral", font_size=10)
+        btns.pack(fill="x", padx=p(18), pady=(p(4), p(2)))
+        self.btn_widget = self._mkbtn(btns, "ويدجيت", self.toggle_widget, kind="neutral", font_size=10)
         self.btn_widget.pack(side="left", padx=2)
         self._paint_widget_btn()
         self.operations_toolbar = btns
+        self._sync_selection_actions()
+        self.main_wrap.canvas.bind("<Configure>", self._responsive_cards, add="+")
 
         # الملخص
         self.lbl_sum = tk.Label(self.main_page, text="", bg=BG, fg=t["total"],
                                 font=("Segoe UI", 11, "bold"))
         self.lbl_sum.pack(fill="x", padx=p(20), pady=p(10))
         self._update_rajhi_visibility()
+        self._responsive_cards()
 
         # صفحة المخطط (مخفية حتى يُطلب عرضها)
         self.chart_page = ScrollArea(self.page_holder, BG)
@@ -3973,6 +4090,7 @@ class GoldApp:
             elif not show and visible:
                 for w, _o in kids:
                     w.pack_forget()
+        self._responsive_cards()
 
     def on_karat_change(self):
         txt = str(self.karat_var.get()).split()[0]
@@ -4124,8 +4242,8 @@ class GoldApp:
             return
         t = self.theme
         CARD, MUT, GOLD = t["card"], t["muted"], t["accent"]
-        body = self._open_page("addbuy", "＋ إضافة عملية شراء")
-        body.title("＋ إضافة عملية شراء")
+        body = self._open_page("addbuy", "+ إضافة عملية شراء")
+        body.title("+ إضافة عملية شراء")
 
         self.ab_name = tk.StringVar()
         self.ab_qty = tk.StringVar()
@@ -4142,10 +4260,10 @@ class GoldApp:
         tk.Frame(card, bg=t.get("border", "#252c39"), height=1).pack(
             fill="x", padx=self._px(14), pady=(self._px(8), 0))
 
-        grid = tk.Frame(card, bg=CARD)
-        grid.pack(fill="x", padx=self._px(10), pady=(self._px(6), self._px(14)))
-        for c in (0, 1):
-            grid.columnconfigure(c, weight=1, uniform="ab")
+        sections = [self._form_section(card, title) for title in
+                    ("بيانات العملية", "الوزن والعيار", "السعر والقيمة")]
+        for section in sections:
+            for c in (0, 1, 2): section.columnconfigure(c, weight=1, uniform="ab")
 
         def entry(parent, var, fsize=12):
             return tk.Entry(parent, textvariable=var, justify="center",
@@ -4157,8 +4275,8 @@ class GoldApp:
                             font=("Segoe UI", fsize))
 
         def cell(row, col, label, builder, hint=""):
-            box = tk.Frame(grid, bg=CARD)
-            box.grid(row=row, column=col, sticky="ew", padx=self._px(8),
+            box = tk.Frame(sections[row], bg=CARD)
+            box.grid(row=0, column=col, sticky="ew", padx=self._px(8),
                      pady=self._px(5))
             tk.Label(box, text=label, bg=CARD, fg=MUT, anchor="e",
                      font=("Segoe UI", 10)).pack(fill="x")
@@ -4172,20 +4290,20 @@ class GoldApp:
         self.ab_name_e = cell(0, 1, "اسم العملية",
                               lambda p: entry(p, self.ab_name),
                               hint="مثال: سبيكة 10 غرام")
-        self.ab_qty_e = cell(0, 0, "الوزن", lambda p: entry(p, self.ab_qty),
+        self.ab_qty_e = cell(1, 0, "الوزن", lambda p: entry(p, self.ab_qty),
                              hint="بالوحدة المختارة")
         cell(1, 1, "الوحدة",
              lambda p: ttk.OptionMenu(p, self.ab_unit, self.ab_unit.get(),
                                       "غرام", "أونصة"))
-        cell(1, 0, "العيار",
+        cell(1, 2, "العيار",
              lambda p: ttk.OptionMenu(p, self.ab_karat, self.ab_karat.get(),
                                       *["{} قيراط".format(k) for k in KARATS]))
         self.ab_price_e = cell(2, 1, "سعر الشراء للوحدة",
                                lambda p: entry(p, self.ab_price),
                                hint="بالعملة الحالية: {}".format(
                                    CUR[self.cur]["name"]))
-        tot_box = tk.Frame(grid, bg=CARD)
-        tot_box.grid(row=2, column=0, sticky="ew", padx=self._px(8),
+        tot_box = tk.Frame(sections[2], bg=CARD)
+        tot_box.grid(row=0, column=0, sticky="ew", padx=self._px(8),
                      pady=self._px(5))
         tk.Label(tot_box, text="إجمالي التكلفة", bg=CARD, fg=MUT, anchor="e",
                  font=("Segoe UI", 10)).pack(fill="x")
@@ -4199,13 +4317,13 @@ class GoldApp:
             except Exception:
                 pass
 
-        bar = tk.Frame(body, bg=t["bg"])
-        bar.pack(fill="x", padx=self._px(4), pady=(self._px(2), self._px(8)))
+        bar = self._form_actions("addbuy")
         self._mkbtn(bar, "💾  حفظ العملية", self.add_item, kind="primary",
                     font_size=12).pack(side="right")
         self._mkbtn(bar, "⟲  السعر الحالي", self._addbuy_use_price,
                     kind="neutral", font_size=10).pack(side="right",
                                                        padx=self._px(8))
+        self._mkbtn(bar, "إلغاء", body.go_back, kind="neutral", font_size=10).pack(side="left", padx=4)
         self._mkbtn(bar, "🧹  تفريغ الحقول", self._addbuy_clear,
                     kind="ghost", font_size=10).pack(side="left")
 
@@ -4286,8 +4404,10 @@ class GoldApp:
             messagebox.showinfo("تعديل مقتنى","حدد مقتنى متبقياً من الجدول أولاً. تعديل المبيعات المحققة غير متاح.",parent=self.root)
             return
         index=selected[1]; holding=self.holdings[index]
-        win=tk.Toplevel(self.root); win.title("تعديل المقتنى المتبقي")
-        win.transient(self.root); win.grab_set(); win.configure(bg=self.theme["card"])
+        win=self._open_page("editholding", "تعديل المقتنى المتبقي")
+        win.configure(bg=self.theme["bg"])
+        sections = [self._form_section(win, title) for title in
+                    ("بيانات العملية", "الوزن والعيار", "السعر والقيمة")]
         # Reject a stale editor after undo/restore/account switch.
         owner=self.user
         variables=[]
@@ -4295,10 +4415,12 @@ class GoldApp:
                 "تكلفة الشراء للوحدة ("+self.cur+")","العيار")
         values=(holding.get("name",""),holding["qty"],float(holding["buy"])*self.rate(),holding.get("karat",24))
         currency=self.cur
-        for label,value in zip(labels,values):
-            tk.Label(win,text=label,bg=self.theme["card"],fg=self.theme["text"],font=("Segoe UI",12)).pack(pady=4)
+        for index_field, (label,value) in enumerate(zip(labels,values)):
+            section = sections[0 if index_field == 0 else (2 if index_field == 2 else 1)]
+            tk.Label(section, text=label, bg=self.theme["card"], fg=self.theme["muted"],
+                     font=("Segoe UI",10), anchor="e").pack(fill="x", pady=4)
             var=tk.StringVar(value=str(value));variables.append(var)
-            tk.Entry(win,textvariable=var,font=("Segoe UI",12),width=28).pack(padx=20,pady=4)
+            self._mkentry(section, var, width=28).pack(fill="x", padx=8, pady=4, ipady=5)
         tk.Label(win,text="التعديل يخص الرصيد المتبقي؛ لا يعيد كتابة سجل الشراء الأصلي أو المبيعات السابقة.\nيمكن التراجع عنه لخطوة واحدة.",bg=self.theme["card"],fg=self.theme["muted"],wraplength=380).pack(padx=20,pady=8)
         def apply():
             if self.user!=owner or self.cur!=currency or index>=len(self.holdings) or self.holdings[index] is not holding:
@@ -4308,7 +4430,9 @@ class GoldApp:
             except ValueError as exc:
                 messagebox.showwarning("تعديل مقتنى",str(exc),parent=win);return
             win.destroy();self.render()
-        self._mkbtn(win,"حفظ التعديل",apply).pack(pady=12)
+        actions = self._form_actions("editholding")
+        self._mkbtn(actions, "حفظ التعديل", apply).pack(side="right", padx=4)
+        self._mkbtn(actions, "إلغاء", win.go_back, kind="neutral").pack(side="left", padx=4)
 
     def _checkpoint_undo(self, label):
         """One deep snapshot of portfolio operations, isolated to this session/account."""
@@ -4760,9 +4884,9 @@ class GoldApp:
                 pass
             self._close_page("sell")
 
-        bar = tk.Frame(win, bg=BG)
+        bar = self._form_actions("sell")
         bar.pack(fill="x", padx=px(12), pady=(px(4), px(10)))
-        self._mkbtn(bar, "✔  تأكيد البيع", do_sell, kind="success",
+        self._mkbtn(bar, "تأكيد البيع", do_sell, kind="primary",
                     font_size=11).pack(side="right", padx=px(6))
         self._mkbtn(bar, "إلغاء", lambda: (stop_tick(), self._close_page("sell")),
                     kind="neutral", font_size=10).pack(side="right", padx=px(6))
@@ -5026,6 +5150,7 @@ class GoldApp:
         if name not in pages or pages[name] is None:
             name = "main"
         self._page = name
+        self._paint_navigation(name)
         for page in pages.values():
             if page is not None and page.winfo_manager():
                 page.pack_forget()
@@ -5094,7 +5219,7 @@ class GoldApp:
         scroll.canvas.bind("<Configure>", _fit, add="+")
         self.root.after(80, _fit)
         self._pages[key] = {"container": container, "header": header,
-                            "body": body, "scroll": scroll}
+                            "body": body, "scroll": scroll, "footer": foot}
         self._show_page(key)
         return body
 
@@ -6318,6 +6443,7 @@ class GoldApp:
                 empty.pack(fill="x", padx=self._px(18), pady=(0, 2), before=toolbar)
 
     def render(self):
+        selected = self.tree.selection() if hasattr(self.tree, "selection") else ()
         viewport = None
         canvas = getattr(getattr(self, "main_wrap", None), "canvas", None)
         if canvas is not None:
@@ -6378,7 +6504,7 @@ class GoldApp:
             self.tree.insert("", "end", iid=iid, tags=("soldgreen",),
                              values=tuple(self._hide(_v) for _v in (
                 "💰 {}".format(s.get("name", "بيع ذهب")),
-                "✔ بيع ({})".format(s_karat),
+                "✓ تم البيع ({})".format(s_karat),
                 "{:g} {}".format(s["qty"], unit_txt),
                 "{}{:,.2f}".format(sym, s["buy"] * self.rate()),
                 "{}{:,.2f}".format(sym, cost_disp),
@@ -6403,6 +6529,9 @@ class GoldApp:
                 "{}{}{:,.2f}".format("+" if t_pl > 0 else "", sym, t_pl),
                 "{}{:.2f}%".format("+" if t_pl > 0 else "", t_pct))))
         self._fit_operations_table()
+        if selected and selected[0] in self.tree.get_children():
+            self.tree.selection_set(selected[0])
+        self._sync_selection_actions()
         self.lbl_sum.config(
             text=self._hide(
                 ("الربح المحقق: {sg_r}{s}{r:,.2f}    |    غير المحقق: {sg_u}{s}{u:,.2f}"
