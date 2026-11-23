@@ -2,7 +2,7 @@
 """
 محفظة الذهب — Gold Portfolio
 تطبيق سطح مكتب (Tkinter) لتتبّع محفظة الذهب: شراء / بيع / ربح وخسارة /
-حاسبة زكاة / سجل عمليات / مخطط سعر الغرام. يعمل بمكتبة بايثون القياسية فقط
+حاسبة زكاة / سجل عمليات / مخطط سعر الغرام. يستخدم Requests لطلبات أسعار السوق
 (التصدير إلى Excel اختياري إن توفّر openpyxl).
 """
 import os
@@ -12,6 +12,11 @@ import hashlib
 import hmac
 import shutil
 import threading
+import queue
+try:
+    import requests
+except ImportError:
+    requests = None
 import math
 import re
 import sys
@@ -19,7 +24,7 @@ import glob
 import base64
 import subprocess
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import ttk, messagebox, colorchooser, filedialog
 import urllib.request
@@ -30,14 +35,16 @@ import smtplib
 import imaplib
 import ssl
 import webbrowser
+from email.utils import parsedate_to_datetime
 from email.mime.text import MIMEText
 from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
+APP_VERSION = "PriceFix-5-LiveSources"
+HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
-FLASH_MS = 7000                           # وميض تغيّر السعر: إيقاع ثابت كل 7 ثوانٍ
-FLASH_HOLD = 320                          # مدة بقاء الوميض (مللي ثانية)
+FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
 HOME_DIR = os.path.expanduser("~")
 # ملف واحد للبيانات القديمة (قبل نظام الحسابات) — يُتبنّى عند إنشاء أول حساب
 DATA_FILE = os.path.join(HOME_DIR, "gold_portfolio_data.json")
@@ -474,73 +481,232 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 # ============================ أدوات مساعدة ============================
+_market_http_local = threading.local()
+
+
+def _market_session():
+    # Sessions are private to each worker, never shared across threads.
+    session = getattr(_market_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": BROWSER_UA,
+                                "Accept": "application/json, text/plain, */*",
+                                "Cache-Control": "no-cache, no-store, max-age=0",
+                                "Pragma": "no-cache"})
+        # No hidden HTTP retries: the five-second supervisor handles retrying.
+        adapter = requests.adapters.HTTPAdapter(max_retries=0,
+                                                pool_connections=2, pool_maxsize=2)
+        session.mount("https://", adapter)
+        _market_http_local.session = session
+    return session
+
+
+def _close_market_session():
+    session = getattr(_market_http_local, "session", None)
+    if session is not None:
+        try:
+            session.close()
+        finally:
+            del _market_http_local.session
+
+
+def _market_get(url, timeout, as_json):
+    budget = float(timeout)
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("مهلة طلب غير صحيحة")
+    # Separate connect/read limits; DNS and redirects can still exceed them.
+    limits = (budget / 2.0, budget / 2.0)
+    if requests is None:
+        # Startup never depends on installing an optional third-party package.
+        req = urllib.request.Request(url, headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache"})
+        with urllib.request.urlopen(req, timeout=budget) as response:
+            _remember_response_clock(response.headers.get("Date"))
+            text = response.read().decode("utf-8", "replace")
+            return json.loads(text) if as_json else text
+    try:
+        with _market_session().get(url, timeout=limits, verify=True) as response:
+            response.raise_for_status()
+            _remember_response_clock(response.headers.get("Date"))
+            if as_json:
+                return response.json()
+            response.encoding = response.encoding or "utf-8"
+            return response.text
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError("Requests: انتهت مهلة الاتصال أو قراءة المصدر") from exc
+    except requests.exceptions.SSLError as exc:
+        raise RuntimeError("Requests: تعذّر التحقق من شهادة HTTPS") from exc
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        raise RuntimeError("Requests: رفض المصدر الطلب HTTP {}".format(status)) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError("Requests: تعذّر الاتصال بمصدر السعر") from exc
+    except ValueError as exc:
+        raise RuntimeError("Requests: استجابة المصدر ليست JSON صالحاً") from exc
+
+
 def http_json(url, timeout=10):
-    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA,
-                                              "Accept": "application/json",
-                                              "Cache-Control": "no-cache",
-                                              "Pragma": "no-cache"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "ignore"))
+    return _market_get(url, timeout, as_json=True)
 
 
 def _http_text(url, timeout=10):
-    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA,
-                                              "Cache-Control": "no-cache",
-                                              "Pragma": "no-cache"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "ignore")
+    return _market_get(url, timeout, as_json=False)
 
 
-def _yahoo_last(symbol):
-    data = http_json("https://query1.finance.yahoo.com/v8/finance/chart/{}"
-                     "?interval=1m&range=1d".format(symbol), timeout=5)
-    res = (data.get("chart") or {}).get("result") or []
-    meta = (res[0] or {}).get("meta") or {}
-    price = meta.get("regularMarketPrice")
-    if not price:
-        q = ((res[0].get("indicators") or {}).get("quote") or [{}])[0]
-        closes = [c for c in (q.get("close") or []) if c]
-        price = closes[-1] if closes else None
+def _valid_price(value):
+    """Reject non-numeric, non-finite and non-positive market quotes."""
+    if isinstance(value, bool):
+        raise ValueError("قيمة سعر غير صحيحة")
+    price = float(value)
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("قيمة سعر غير صحيحة")
     return price
 
 
-def fetch_spot_usd(mode="auto", timeout=4, only=False):
-    """جلب سعر أونصة الذهب بالدولار من عدة مصادر مجانية (بمهلة قصيرة لكل مصدر)."""
-    sources = [
-        ("gold-api", lambda: http_json("https://api.gold-api.com/price/XAU",
-                                       timeout=timeout).get("price")),
-        ("goldprice.org", lambda: http_json(
-            "https://data-asg.goldprice.org/dbXRates/USD",
-            timeout=timeout)["items"][0]["xauPrice"]),
-        ("yahoo", lambda: _yahoo_last("GC=F")),
-        ("paxg", lambda: http_json(
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=pax-gold&vs_currencies=usd", timeout=timeout)["pax-gold"]["usd"]),
-        ("stooq", lambda: float(
-            _http_text("https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv",
-                       timeout=timeout).strip().splitlines()[-1].split(",")[6])),
-    ]
-    if mode and mode != "auto":
-        if only:
-            sources = [s for s in sources if s[0] == mode]
-        else:
-            # المصدر المختار أولاً، ثم البقية تلقائياً إن تعذّر (لا يتوقف التحديث أبداً)
-            first = [s for s in sources if s[0] == mode]
-            rest = [s for s in sources if s[0] != mode]
-            sources = first + rest
-    last_err = None
-    started = time.time()
-    for name, fn in sources:
-        if time.time() - started > 12:
-            break
+def _yahoo_last(symbol, timeout=2):
+    data = http_json("https://query1.finance.yahoo.com/v8/finance/chart/{}"
+                     "?interval=1m&range=1d".format(symbol), timeout=timeout)
+    res = (data.get("chart") or {}).get("result") or []
+    if not res:
+        raise ValueError("لا توجد بيانات")
+    price = (res[0].get("meta") or {}).get("regularMarketPrice")
+    if price is None:
+        q = ((res[0].get("indicators") or {}).get("quote") or [{}])[0]
+        closes = [c for c in (q.get("close") or []) if c is not None]
+        price = closes[-1] if closes else None
+    return _valid_price(price)
+
+
+QUOTE_MAX_AGE = 20.0
+
+
+class MarketQuote(tuple):
+    """Backward-compatible (price, label), with verified source timestamp."""
+    def __new__(cls, price, label, source_id, quote_time):
+        obj = super().__new__(cls, (price, label))
+        obj.source_id = source_id
+        obj.quote_time = quote_time
+        return obj
+
+
+def _remember_response_clock(value):
+    _market_http_local.server_time = None
+    if isinstance(value, str):
         try:
-            val = fn()
-            if val and float(val) > 0:
-                return float(val), name
-        except Exception as e:  # noqa
-            last_err = "{}: {}".format(name, e)
-            continue
-    raise RuntimeError("تعذّر جلب السعر: {}".format(last_err))
+            _market_http_local.server_time = parsedate_to_datetime(value).timestamp()
+        except (ValueError, TypeError, OverflowError):
+            pass
+
+
+def _quote_epoch(value):
+    if isinstance(value, bool) or value is None:
+        raise ValueError("وقت التسعير مفقود")
+    if isinstance(value, str) and not value.replace(".", "", 1).isdigit():
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError("منطقة وقت التسعير مفقودة")
+        value = stamp.timestamp()
+    value = float(value)
+    if value > 1e11:
+        value /= 1000.0
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("وقت التسعير غير صحيح")
+    return value
+
+
+def _fresh_quote(value, source_id, label, timestamp):
+    stamp = _quote_epoch(timestamp)
+    now = getattr(_market_http_local, "server_time", None) or time.time()
+    age = now - stamp
+    if age > QUOTE_MAX_AGE or age < -10:
+        raise ValueError("بيانات المصدر قديمة أو وقتها غير صحيح (العمر {:.0f} ثانية)".format(age))
+    utc = datetime.fromtimestamp(stamp, timezone.utc).strftime("%H:%M:%S UTC")
+    return MarketQuote(_valid_price(value), label + " • وقت السعر " + utc + " • " + HTTP_BACKEND,
+                       source_id, stamp)
+
+
+def _swissquote(data):
+    if not isinstance(data, list):
+        raise ValueError("استجابة Swissquote غير صحيحة")
+    # Use one stable platform/profile, not whichever spread happens to move.
+    rows = [r for r in data if isinstance(r, dict) and
+            (r.get("topo") or {}).get("platform") == "AT"]
+    if not rows:
+        raise ValueError("منصة AT غير متوفرة")
+    row = max(rows, key=lambda r: _quote_epoch(r.get("ts")))
+    prices = [q for q in row.get("spreadProfilePrices", [])
+              if q.get("spreadProfile") == "standard"]
+    if not prices:
+        raise ValueError("تسعير standard غير متوفر")
+    bid, ask = _valid_price(prices[0].get("bid")), _valid_price(prices[0].get("ask"))
+    if ask < bid:
+        raise ValueError("سعر العرض أقل من سعر الطلب")
+    # Broker XAU/USD quote midpoint, not a futures or a token price.
+    return _fresh_quote((bid + ask) / 2, "swissquote",
+                        "Swissquote XAU/USD • متوسط Bid/Ask", row.get("ts"))
+
+
+def fetch_spot_usd(mode="auto", timeout=2, only=False):
+    timeout = max(0.1, min(float(timeout), 6.0))
+    spot_names = ("swissquote", "gold-api", "goldprice.org")
+    names = list(spot_names)
+    if only:
+        if mode not in spot_names + ("stooq", "yahoo", "paxg"):
+            raise ValueError("مصدر غير معروف")
+        names = [mode]
+    elif mode in spot_names:
+        names.remove(mode)
+        names.insert(0, mode)
+    deadline = time.monotonic() + (timeout if only else min(4.0, timeout * 2))
+    errors = []
+    for name in names:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        limit = min(timeout, remaining)
+        try:
+            # Do not reuse another response's HTTP Date in freshness checks.
+            _market_http_local.server_time = None
+            if name == "swissquote":
+                data = http_json("https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
+                                 timeout=limit)
+                quote = _swissquote(data)
+            elif name == "gold-api":
+                data = http_json("https://api.gold-api.com/price/XAU", timeout=limit)
+                if data.get("symbol") not in (None, "XAU") or data.get("currency") not in (None, "USD"):
+                    raise ValueError("المعدن أو العملة غير صحيح")
+                quote = _fresh_quote(data.get("price"), name, "gold-api", data.get("updatedAt"))
+            elif name == "goldprice.org":
+                data = http_json("https://data-asg.goldprice.org/dbXRates/USD", timeout=limit)
+                item = data["items"][0]
+                if item.get("curr") not in (None, "USD"):
+                    raise ValueError("عملة المصدر ليست الدولار")
+                quote = _fresh_quote(item["xauPrice"], name, name, data.get("ts") or item.get("ts"))
+            elif name == "yahoo":
+                quote = (_yahoo_last("GC=F", timeout=limit), "yahoo — عقود آجلة للتشخيص فقط")
+            elif name == "paxg":
+                value = http_json("https://api.coingecko.com/api/v3/simple/price?ids=pax-gold&vs_currencies=usd",
+                                  timeout=limit)["pax-gold"]["usd"]
+                quote = (_valid_price(value), "paxg — رمز رقمي للتشخيص فقط")
+            else:
+                fields = _http_text("https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv",
+                                    timeout=limit).strip().splitlines()[-1].split(",")
+                if fields[0].strip().upper() != "XAUUSD":
+                    raise ValueError("رمز المصدر غير صحيح")
+                quote = (_valid_price(fields[6]), "stooq — بيانات قد تكون متأخرة؛ للتشخيص فقط")
+            if time.monotonic() > deadline:
+                raise TimeoutError("انتهت مهلة جلب السعر")
+            previous = getattr(_market_http_local, "previous_quote", None)
+            if (isinstance(quote, MarketQuote) and previous and
+                    previous[1] is not None and quote.quote_time <= previous[1]):
+                raise ValueError("المصدر يعيد وقت التسعير السابق؛ تجربة مصدر بديل")
+            return quote
+        except Exception as exc:
+            errors.append("{}: {}".format(name, exc))
+    raise RuntimeError("تعذّر جلب سعر حديث: " + ("; ".join(errors) or "انتهت المهلة"))
 
 
 def market_closed():
@@ -1520,8 +1686,19 @@ class GoldApp:
         self._fx_last = 0.0
         self._fetch_lock = threading.Lock()
         self._fetch_busy = False
-        self._flash_job = None      # مؤقّت الوميض الثابت (7 ثوانٍ)
-        self._flash_price = 0.0     # السعر عند آخر وميض
+        self._fetch_results = queue.Queue()
+        self._fetch_generation = 0
+        self._fetch_serial = 0
+        self._result_job = None
+        self._price_workers = {}
+        self._fetch_started = 0.0
+        self._live_due = 0.0
+        self._live_attempts = 0
+        self._live_error = ""
+        self._last_quote_source = None
+        self._last_quote_timestamp = None
+        self._fx_busy = False
+        self._fx_retry_at = 0.0
         self.al_win = None
         self.row_map = {}
         self.price_widget = None   # الويدجيت العائم لسعر الغرام
@@ -2565,7 +2742,7 @@ class GoldApp:
                 self.theme.update(d.get("theme", {}))
             self.titles.update(d.get("titles", {}))
             self.sound_on = bool(d.get("sound_on", True))
-            self.source_mode = d.get("source_mode", "auto")
+            self.source_mode = "auto"  # migrate old saved choices to fresh primary feed
             self.show_sells = bool(d.get("show_sells", True))
             self.spot_oz_usd = float(d.get("spot_oz_usd", 0.0) or 0.0)
             self.rates.update(d.get("rates", {}))
@@ -2690,6 +2867,11 @@ class GoldApp:
     # ============================ الحسابات وتسجيل الدخول ============================
     def _reset_state(self):
         """يعيد كل الحقول إلى الافتراضي قبل تحميل بيانات مستخدم آخر."""
+        self._fetch_generation += 1
+        self._last_quote_source = None
+        self._last_quote_timestamp = None
+        self._fx_last = 0.0
+        self._fx_retry_at = 0.0
         self.holdings = []
         self.sells = []
         self.show_sells = True
@@ -3710,7 +3892,7 @@ class GoldApp:
         BG, CARD, CARD2 = t["bg"], t["card"], t["card2"]
         GOLD, ATXT, TXT, MUT = t["accent"], t["accent_text"], t["text"], t["muted"]
         self.root.configure(bg=BG)
-        self.root.title(self.titles.get("window", DEFAULT_TITLES["window"]))
+        self.root.title(self.titles.get("window", DEFAULT_TITLES["window"]) + " — " + APP_VERSION)
         self._apply_screen_layout()
         p = self._px
 
@@ -5070,6 +5252,8 @@ class GoldApp:
         self._page = "main"
         self.build_ui()
         self.render()
+        if getattr(self, "user", None):
+            self.start_live_refresh()
         if was_widget and getattr(self, "user", None):
             self.open_widget()
 
@@ -5773,183 +5957,270 @@ class GoldApp:
     def start_live_refresh(self):
         if not getattr(self, "user", None):
             return
-        if getattr(self, "_live_on", False):
-            self.refresh_all()
-            return
         self._live_on = True
-        self.refresh_all()
-        self.root.after(LIVE_MS, self._loop_refresh)
-        self._start_flash_loop()
+        # Arm the supervisor BEFORE any network or display work can raise.
+        self._live_due = time.monotonic()
+        self._ensure_result_pump()
+        self._supervise_live_refresh()
 
-    def _loop_refresh(self):
-        if not getattr(self, "_live_on", False) or not getattr(self, "user", None):
-            return
-        self.refresh_all()
-        self.root.after(self.refresh_interval(), self._loop_refresh)
-
-    def refresh_interval(self):
-        """٥ ثوانٍ في الوضع الطبيعي، وتباطؤ تلقائي عند تكرار فشل الاتصال."""
-        f = int(getattr(self, "_fails", 0) or 0)
-        if f >= 6:
-            return 60000
-        if f >= 4:
-            return 30000
-        if f >= 2:
-            return 15000
-        return LIVE_MS
-
-    def refresh_all(self):
-        # لا نبدأ طلباً جديداً قبل انتهاء السابق (يمنع تراكم الطلبات وبطء الواجهة)
-        lock = getattr(self, "_fetch_lock", None) or threading.Lock()
-        self._fetch_lock = lock
-        with lock:
-            if getattr(self, "_fetch_busy", False):
-                return
-            self._fetch_busy = True
-        threading.Thread(target=self._fetch_once, daemon=True).start()
-
-    def _fetch_once(self):
-        msg = ""
-        direction = None
-        changed = False
-        try:
-            new_price, source = fetch_spot_usd(self.source_mode)
-            old_price = self.spot_oz_usd
-            changed = (not old_price) or (abs(float(new_price) - float(old_price)) > 1e-9)
-            self._delta_oz = (new_price - old_price) if old_price else 0.0
-            direction = ("up" if new_price > old_price else
-                         ("down" if new_price < old_price else "same")) if old_price else None
-            self.spot_oz_usd = new_price
-            self._record_price_sample(new_price)
-            self._ticks += 1
-            self._fails = 0
-            now = datetime.now().strftime("%H:%M:%S")
-            self.last_update = now
-            if self._ticks == 1 or self._ticks % 12 == 0:
-                self.save()
-            closed = "  •  🔒 السوق مغلق — السعر ثابت حتى الفتح" if market_closed() else ""
-            msg = "● مباشر ({src}) • الأونصة ${p:.3f} • {t} • تحديثات {n}{c}".format(
-                src=source, p=new_price, t=now, n=self._ticks, c=closed)
-        except Exception as e:
-            direction = None
-            self._fails += 1
-            reason = ""
-            try:
-                reason = str(e).split(":", 1)[-1].strip()[:45]
-            except Exception:
-                reason = ""
-            tag = " ({})".format(reason) if reason and self._fails <= 3 else ""
-            if self.spot_oz_usd:
-                when = " — آخر سعر {}".format(self.last_update) if self.last_update else ""
-                msg = "تعذّر التحديث (محاولة {}){}… عرض آخر سعر معروف{}".format(
-                    self._fails, tag, when)
-            else:
-                msg = ("تعذّر جلب سعر الذهب{} — اضغط «🔍 تشخيص» أو «F5»"
-                       .format(tag))
-
-        nowt = time.monotonic()
-        fx_changed = False
-        if nowt - self._fx_last > 300:
-            try:
-                fx = http_json("https://open.er-api.com/v6/latest/USD", timeout=6)
-                if fx.get("rates"):
-                    for k in ("SAR", "JOD", "KWD", "QAR", "EGP"):
-                        if k in fx["rates"] and abs(
-                                float(fx["rates"][k]) - float(self.rates.get(k, 0) or 0)) > 1e-9:
-                            self.rates[k] = fx["rates"][k]
-                            fx_changed = True
-                self._fx_last = nowt
-            except Exception:
-                pass
-
-        def paint():
-            try:
-                self.lbl_upd.config(text=msg)
-            except Exception:
-                pass
-            # إعادة الرسم فقط عند تغيّر السعر/سعر الصرف فعلاً (تمنع رجفة الجدول)
-            if changed or fx_changed:
-                try:
-                    self.render()
-                except Exception:
-                    pass
-            # الوميض له إيقاعه الثابت (كل 7 ثوانٍ) وليس مع كل جلب
-
-        try:
-            self.root.after(0, paint)
-        except Exception:
-            pass
-        finally:
-            lock = getattr(self, "_fetch_lock", None)
-            if lock is not None:
-                with lock:
-                    self._fetch_busy = False
-
-
-    # ---------- وميض تغيّر السعر: إيقاع ثابت كل 7 ثوانٍ ----------
-    def _start_flash_loop(self):
-        """يضبط مرجع الوميض وينطلق بمؤقّت ثابت (7 ثوانٍ)."""
-        job = getattr(self, "_flash_job", None)
+    def _arm_live_loop(self):
+        # Compatibility hook: one supervisor owns scheduling, not two loops.
+        job = getattr(self, "_live_job", None)
         if job:
             try:
                 self.root.after_cancel(job)
-            except Exception:
+            except tk.TclError:
                 pass
-        self._flash_job = None
-        self._flash_price = float(getattr(self, "spot_oz_usd", 0) or 0)
-        try:
-            self._flash_job = self.root.after(FLASH_MS, self._flash_tick)
-        except Exception:
-            self._flash_job = None
+        self._live_job = None
+        self._live_due = time.monotonic() + self.refresh_interval() / 1000.0
+        self._ensure_result_pump()
 
-    def _flash_tick(self):
-        """كل 7 ثوانٍ: يومض فقط إذا تغيّر السعر فعلاً منذ الوميض السابق."""
-        self._flash_job = None
-        if not getattr(self, "_live_on", False) or not getattr(self, "user", None):
+    def _loop_refresh(self):
+        self._live_job = None
+        self._supervise_live_refresh()
+        self._ensure_result_pump()
+
+    def _supervise_live_refresh(self):
+        if not self._live_on or not self.user:
             return
-        cur = float(getattr(self, "spot_oz_usd", 0) or 0)
-        prev = float(getattr(self, "_flash_price", 0) or 0)
-        if cur:
-            self._flash_price = cur
-        if cur and prev and abs(cur - prev) > 1e-9 and not getattr(self, "locked", False):
-            self.flash_update("up" if cur > prev else "down")
+        now = time.monotonic()
+        if now < self._live_due:
+            return
+        # Schedule from a monotonic deadline, independent of fetch completion.
+        self._live_due = now + self.refresh_interval() / 1000.0
         try:
-            self._flash_job = self.root.after(FLASH_MS, self._flash_tick)
+            self.refresh_all()
+        except Exception as exc:
+            self._live_error = str(exc)[:160]
+
+    def refresh_interval(self):
+        """تحديث مستمر وثابت كل ٥ ثوانٍ (لا تباطؤ يُشعرك بتوقّف التحديث)."""
+        return LIVE_MS
+
+    def _ensure_result_pump(self):
+        # Recover a stale timer ID, e.g. after a UI rebuild/cancelled callback.
+        job = self._result_job
+        if job is not None:
+            try:
+                self.root.tk.call("after", "info", job)
+                return
+            except (tk.TclError, AttributeError):
+                if not hasattr(self.root, "tk"):
+                    return
+                self._result_job = None
+        self._result_job = self.root.after(100, self._drain_fetch_results)
+
+    def refresh_all(self):
+        if not getattr(self, "user", None):
+            return
+        self._ensure_result_pump()
+        now = time.monotonic()
+        # Bound worker count: a stuck DNS/network call cannot freeze polling
+        # forever, but also cannot create an unlimited chain of threads.
+        self._price_workers = {k: t for k, t in self._price_workers.items() if t.is_alive()}
+        with self._fetch_lock:
+            if self._fetch_busy and now - self._fetch_started < 4.5:
+                return
+            if len(self._price_workers) >= 2:
+                self.lbl_upd.config(text="انتظار الشبكة — طلبان متأخران؛ المحاولة التالية خلال ٥ ثوانٍ")
+                return
+            self._fetch_busy = True
+            self._fetch_started = now
+            self._fetch_serial += 1
+            serial = self._fetch_serial
+        self._live_attempts += 1
+        context = (self._fetch_generation, self.user)
+        mode = self.source_mode
+        self.lbl_upd.config(text="{} • جارٍ فحص السعر • طلب {} • آخر جلب {}".format(
+            APP_VERSION, self._live_attempts, self.last_update or "—"))
+        try:
+            worker = threading.Thread(target=self._fetch_once,
+                                      args=(context, serial, mode, (self._last_quote_source, self._last_quote_timestamp)), daemon=True)
+            self._price_workers[serial] = worker
+            worker.start()
+        except Exception as exc:
+            self._price_workers.pop(serial, None)
+            self._fetch_results.put(("price", context, serial, None, str(exc)))
+        self._start_fx_fetch(context)
+
+    def _fetch_once(self, context, serial, mode, previous=None):
+        # No Tk calls and no account/model mutations from this worker.
+        _market_http_local.previous_quote = previous
+        try:
+            value = fetch_spot_usd(mode)
+            result = ("price", context, serial, value, None)
+        except Exception as exc:
+            result = ("price", context, serial, None, str(exc))
+        self._fetch_results.put(result)
+        _market_http_local.previous_quote = None
+        _close_market_session()
+
+    def _start_fx_fetch(self, context):
+        now = time.monotonic()
+        if self._fx_busy or now < self._fx_retry_at:
+            return
+        if self._fx_last and now - self._fx_last <= 300:
+            return
+        self._fx_busy = True
+        try:
+            threading.Thread(target=self._fetch_fx_once, args=(context,), daemon=True).start()
+        except Exception as exc:
+            self._fetch_results.put(("fx", context, None, None, str(exc)))
+
+    def _fetch_fx_once(self, context):
+        try:
+            data = http_json("https://open.er-api.com/v6/latest/USD", timeout=4)
+            if data.get("result") != "success" or data.get("base_code") != "USD":
+                raise ValueError("بيانات أسعار الصرف غير صحيحة")
+            rates = {k: _valid_price(data["rates"][k])
+                     for k in ("SAR", "JOD", "KWD", "QAR", "EGP")}
+            result = ("fx", context, None, rates, None)
+        except Exception as exc:
+            result = ("fx", context, None, None, str(exc))
+        self._fetch_results.put(result)
+        _close_market_session()
+
+    def _drain_fetch_results(self):
+        self._result_job = None
+        try:
+            # Bounded drain keeps the UI responsive even after being busy.
+            for _ in range(20):
+                try:
+                    kind, context, serial, value, error = self._fetch_results.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "price":
+                    self._price_workers.pop(serial, None)
+                    if serial != self._fetch_serial:
+                        continue  # Ignore a late response superseded by a newer request.
+                    with self._fetch_lock:
+                        if serial == self._fetch_serial:
+                            self._fetch_busy = False
+                else:
+                    self._fx_busy = False
+                if context != (self._fetch_generation, self.user) or not self.user:
+                    continue  # A result from a previous login/restore is never applied.
+                if kind == "fx":
+                    self._fx_retry_at = time.monotonic() + (60 if error else 0)
+                    if not error:
+                        changed = any(abs(value[k] - self.rates.get(k, 0)) > 1e-9
+                                      for k in value)
+                        self.rates.update(value)
+                        self._fx_last = time.monotonic()
+                        if changed:
+                            self.render()
+                            self.save()
+                else:
+                    self._apply_price_result(value, error)
+        except Exception as exc:
+            self._live_error = str(exc)[:160]
+        finally:
+            try:
+                self._supervise_live_refresh()
+            finally:
+                self._ensure_result_pump()
+
+    def _apply_price_result(self, value, error):
+        if not error:
+            try:
+                new_price, source = value
+                new_price = _valid_price(new_price)
+                if isinstance(value, MarketQuote):
+                    if (self._last_quote_timestamp is not None and
+                            value.quote_time <= self._last_quote_timestamp):
+                        self.lbl_upd.config(text="{} • المصدر لم يرسل تسعيراً أحدث؛ لا يعني ثبات السوق • آخر جلب {}".format(
+                            APP_VERSION, self.last_update or "—"))
+                        return
+                    self._last_quote_source = value.source_id
+                    self._last_quote_timestamp = value.quote_time
+            except Exception as exc:
+                error = str(exc)
+        if error:
+            self._fails += 1
+            self._live_error = str(error)[:500]
+            when = " — آخر جلب ناجح {}".format(self.last_update) if self.last_update else ""
+            msg = ("تعذّر التحديث (محاولة {}) — عرض آخر سعر معروف{}".format(
+                    self._fails, when) if self.spot_oz_usd else
+                   "تعذّر جلب سعر الذهب — إعادة المحاولة كل ٥ ثوانٍ؛ F5 للتحديث")
+            self.lbl_upd.config(text=msg)
+            return
+        old_price = self.spot_oz_usd
+        changed = not old_price or abs(new_price - old_price) > 1e-9
+        direction = ("up" if new_price > old_price else "down") if old_price and changed else None
+        self._delta_oz = new_price - old_price if old_price else 0.0
+        self.spot_oz_usd = new_price
+        self._record_price_sample(new_price)
+        self._ticks += 1
+        self._fails = 0
+        self.last_update = datetime.now().strftime("%H:%M:%S")
+        # Retrieval time is not the exchange's quote time; don't claim otherwise.
+        state = "تغيّر السعر" if changed else "لم تتغير القيمة في التسعير الجديد"
+        msg = "{} • جلب ناجح {} / طلب {} • {} • ${:.3f} • {} • {}".format(
+            APP_VERSION, self._ticks, self._live_attempts, state, new_price, self.last_update, source)
+        self.lbl_upd.config(text=msg)
+        self.update_price_labels()  # Refresh cards/widget even for an unchanged quote.
+        if changed:
+            self.render()
+            if direction:
+                self.flash_update(direction)
+        if self._ticks == 1 or self._ticks % 12 == 0:
+            self.save()
+
+
+    @staticmethod
+    def _mix_color(c1, c2, a=0.18):
+        """يمزج لونين بنسبة a (لتلوين خفيف للخلفية أثناء الوميض)."""
+        try:
+            p1 = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+            p2 = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+            return "#%02x%02x%02x" % tuple(
+                max(0, min(255, int(p1[i] + (p2[i] - p1[i]) * a))) for i in range(3))
         except Exception:
-            self._flash_job = None
+            return c2
 
     def flash_update(self, direction=None):
+        """وميض قصير متناسق مع اتجاه تغيّر السعر (أخضر صعود / أحمر هبوط)."""
         t = self.theme
         hi = {"up": t.get("profit", "#2ecc71"),
               "down": t.get("loss", "#ff5c5c"),
-              "same": t.get("flash_same", "#ffd93b")}.get(direction, t.get("muted", "#888"))
+              "same": t.get("accent", "#e9c684")}.get(direction, t.get("muted", "#888"))
         rest = t.get("muted", "#888")
+        card = t.get("card", "#12161e")
+        soft = self._mix_color(card, hi, 0.20)
         try:
             self.dot.config(fg=hi)
         except Exception:
             pass
-        originals = []
-        for name in ("lbl_gr",):
+        # لا نلتقط لوناً وسط وميض سابق
+        if getattr(self, "_flash_on", False):
+            return
+        self._flash_on = True
+        saved = []
+        for name in ("lbl_gr", "lbl_oz"):
             lbl = getattr(self, name, None)
             if lbl is None:
                 continue
             try:
-                originals.append((lbl, lbl.cget("bg")))
-                lbl.config(bg=hi)
+                saved.append((lbl, lbl.cget("bg"), lbl.cget("fg")))
+                lbl.config(bg=soft, fg=hi)
             except Exception:
                 pass
 
         def revert():
-            for lbl, bg in originals:
+            for lbl, bg, fg in saved:
                 try:
-                    lbl.config(bg=bg)
+                    lbl.config(bg=bg, fg=fg)
                 except Exception:
                     pass
             try:
                 self.dot.config(fg=rest)
             except Exception:
                 pass
-        self.root.after(FLASH_HOLD, revert)
+            self._flash_on = False
+        try:
+            self.root.after(FLASH_HOLD, revert)
+        except Exception:
+            self._flash_on = False
 
     # ============================ العرض ============================
     def price_diag(self):
@@ -5982,7 +6253,8 @@ class GoldApp:
         txt = tk.Text(box, height=9, bg=CARD, fg=TXT, relief="flat", bd=0,
                       font=("Segoe UI", 10), wrap="word")
         txt.pack(fill="both", expand=True, padx=8, pady=8)
-        txt.insert("end", "جارٍ فحص المصادر…\n")
+        txt.insert("end", "{} • الطلبات {} • الجلب الناجح {}\nآخر خطأ داخلي: {}\nجارٍ فحص المصادر…\n".format(
+            APP_VERSION, self._live_attempts, self._ticks, self._live_error or "لا يوجد"))
 
         def add(line):
             def do():
@@ -5997,7 +6269,7 @@ class GoldApp:
                 pass
 
         def run():
-            names = ("gold-api", "goldprice.org", "yahoo", "paxg", "stooq")
+            names = ("swissquote", "gold-api", "goldprice.org", "yahoo", "paxg", "stooq")
             for name in names:
                 t0 = time.time()
                 try:
@@ -6009,7 +6281,7 @@ class GoldApp:
                     add("✘ {}   {}   ({:.2f} ثانية)".format(
                         name, reason, time.time() - t0))
             add("")
-            add("النتيجة: البرنامج يستخدم أول مصدر ينجح، ويعود للبقية تلقائياً."
+            add("النتيجة: التحديث التلقائي يستخدم مصادر الذهب الفوري فقط؛ العقود والرموز الرقمية للتشخيص."
                 if self.spot_oz_usd else
                 "النتيجة: لا يوجد سعر بعد — إن فشلت كل المصادر فالمشكلة في الاتصال/الجدار الناري.")
 
@@ -6232,7 +6504,29 @@ def _enable_dpi_awareness():
 def main():
     _enable_dpi_awareness()
     root = tk.Tk()
-    GoldApp(root)
+    def report_error(exc_type, exc_value, exc_traceback):
+        import traceback
+        details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        try:
+            log_path = os.path.join(HOME_DIR, "GoldPortfolio-startup-error.log")
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write("\n" + datetime.now().isoformat() + " " + APP_VERSION + "\n" + details)
+        except OSError:
+            pass
+        print(details, file=sys.stderr)
+        try:
+            messagebox.showerror("خطأ في تشغيل محفظة الذهب",
+                                 "{}\n\n{}\n\nتمت محاولة حفظ التفاصيل في GoldPortfolio-startup-error.log داخل مجلد المستخدم.".format(
+                                     APP_VERSION, str(exc_value)[:350]), parent=root)
+        except tk.TclError:
+            pass
+    root.report_callback_exception = report_error
+    try:
+        GoldApp(root)
+    except Exception:
+        report_error(*sys.exc_info())
+        root.destroy()
+        raise
     root.mainloop()
 
 

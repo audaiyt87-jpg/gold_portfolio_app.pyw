@@ -1,8 +1,22 @@
 @echo off
 chcp 65001 >nul
-echo Building GoldPortfolio.exe ...
-python -m pip install --upgrade pyinstaller openpyxl
-pyinstaller --noconfirm --onefile --windowed --name GoldPortfolio --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
-echo.
-echo Done. EXE is in the dist\ folder.
+setlocal
+pushd "%~dp0"
+set "PY=python"
+py -3 -c "import sys" >nul 2>&1
+if not errorlevel 1 set "PY=py -3"
+%PY% -m pip install --upgrade pyinstaller
+if errorlevel 1 goto failed
+%PY% -m pip install -r requirements.txt
+if errorlevel 1 goto failed
+%PY% -m PyInstaller --noconfirm --collect-data certifi --hidden-import requests --onefile --windowed --name GoldPortfolio-PriceFix-5-LiveSources --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
+if errorlevel 1 goto failed
+echo Done: dist\GoldPortfolio-PriceFix-5-LiveSources.exe
 pause
+popd
+exit /b 0
+:failed
+echo Build failed. Read the error above; no successful build is claimed.
+pause
+popd
+exit /b 1
