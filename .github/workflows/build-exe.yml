@@ -20,14 +20,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller openpyxl
+          pip install pyinstaller openpyxl requests certifi
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name GoldPortfolio --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
+          pyinstaller --noconfirm --collect-data certifi --hidden-import requests --onefile --windowed --name GoldPortfolio-PriceFix-5-LiveSources --icon app.ico --add-data "app.ico;." gold_portfolio_app.pyw
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: GoldPortfolio-Windows-EXE
-          path: dist/GoldPortfolio.exe
+          path: dist/GoldPortfolio-PriceFix-5-LiveSources.exe
