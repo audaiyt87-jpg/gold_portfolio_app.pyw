@@ -43,7 +43,7 @@ from email import message_from_bytes
 
 # ============================ ثوابت عامة ============================
 OZ_TO_G = 31.1034768                      # غرام في الأونصة الواحدة
-APP_VERSION = "PriceFix-20-NavStates"
+APP_VERSION = "PriceFix-21-ButtonBorders"
 HTTP_BACKEND = "Requests" if requests is not None else "urllib (بديل تلقائي)"
 LIVE_MS = 5000                            # تحديث السعر المباشر كل 5 ثوانٍ
 FLASH_HOLD = 350                          # مدة بقاء وميض تغيّر السعر (مللي ثانية)
@@ -1000,8 +1000,10 @@ class PriceWidget:
     def _mini(self, parent, text, cmd, size=10):
         return tk.Button(parent, text=text, command=cmd, bg=self.card,
                          fg=self.muted, activebackground=self.border,
-                         activeforeground=self.accent, relief="flat", bd=0,
-                         padx=6, pady=0, cursor="hand2",
+                         activeforeground=self.accent, relief="solid", bd=1,
+                         highlightthickness=1, highlightbackground=self.border,
+                         highlightcolor=self.accent, takefocus=True,
+                         padx=6, pady=1, cursor="hand2",
                          font=("Segoe UI", size, "bold"))
 
     def _build(self):
@@ -3221,13 +3223,13 @@ class GoldApp:
             "success": (t["card2"], t["profit"], t["border"]),
             "danger": (t["card2"], t["loss"], t["border"]),
             "neutral": (t["card2"], t["text"], t.get("border", "#252c39")),
-            "ghost": (t["bg"], t["accent"], t.get("card2", "#1a2029")),
+            "ghost": (t["card2"], t["accent"], t["border"]),
         }
         bg, fg, hv = palettes.get(kind, palettes["primary"])
         btn = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                        activebackground=hv, activeforeground=fg, relief="flat",
-                        bd=0, padx=12, pady=7, cursor="hand2",
-                        highlightthickness=1,
+                        activebackground=hv, activeforeground=fg, relief="solid",
+                        bd=1, padx=12, pady=7, cursor="hand2",
+                        highlightthickness=1, takefocus=True, disabledforeground=t["muted"],
                         highlightbackground=t.get("border", "#252c39"),
                         highlightcolor=t["accent"],
                         font=("Segoe UI", font_size, "bold"), **kw)
@@ -3681,7 +3683,7 @@ class GoldApp:
             indicator = tk.Frame(row, bg=t["card2"], width=4)
             indicator.pack(side="right", fill="y")
             button = self._mkbtn(row, label, command, kind="neutral", font_size=11)
-            button.configure(anchor="e", padx=10, pady=11, bg=t["card2"], relief="flat", highlightthickness=0)
+            button.configure(anchor="e", padx=10, pady=11, bg=t["card2"], relief="flat", bd=0, highlightthickness=0)
             button.pack(side="left", fill="both", expand=True)
             self._nav_frames[key] = row
             self._nav_indicators[key] = indicator

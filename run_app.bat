@@ -15,7 +15,7 @@ if not defined PY (
     popd
     exit /b 1
 )
-echo Starting GoldPortfolio PriceFix-20-NavStates ...
+echo Starting GoldPortfolio PriceFix-21-ButtonBorders ...
 %PY% -u gold_portfolio_app.pyw > startup.log 2>&1
 set "RESULT=%errorlevel%"
 if not "%RESULT%"=="0" (
